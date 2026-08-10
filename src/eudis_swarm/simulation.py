@@ -1,4 +1,4 @@
-"""Deterministic Prototype 0.2A simulation and command-line entry point."""
+"""Deterministic Prototype 0.2B simulation and command-line entry point."""
 
 from __future__ import annotations
 
@@ -10,12 +10,14 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Mapping, Sequence
 
-from .agent import Agent, AgentStatus, Position
+from .agent import Agent, AgentStatus, Heartbeat, Position
 from .communication import CommunicationGraph, CommunicationUpdate
 from .config import SimulationConfig
 from .failure_manager import FailureManager
+from .messaging import DeliveryBatch, PeerStateTransport
 from .metrics import SimulationMetrics
 from .mission import Mission
+from .peer_state import PeerStateStore
 from .task import Task
 from .task_allocator import TaskAllocator
 from .validation import validate_timestamp
@@ -46,6 +48,21 @@ class CommunicationEvent:
     component_count: int | None = None
 
 
+class PeerStateEventKind(str, Enum):
+    """Meaningful receiver-local peer-knowledge transitions."""
+
+    STALE = "STALE"
+    REFRESHED = "REFRESHED"
+
+
+@dataclass(frozen=True, slots=True)
+class PeerStateEvent:
+    kind: PeerStateEventKind
+    timestamp: float
+    observer_agent_id: int
+    peer_agent_id: int
+
+
 @dataclass(frozen=True, slots=True)
 class SimulationResult:
     mission: Mission
@@ -53,6 +70,8 @@ class SimulationResult:
     position_history: dict[int, tuple[tuple[float, Position], ...]]
     communication_graph: CommunicationGraph | None = None
     communication_events: tuple[CommunicationEvent, ...] = ()
+    peer_state_stores: dict[int, PeerStateStore] | None = None
+    peer_state_events: tuple[PeerStateEvent, ...] = ()
 
 
 def _initial_positions(config: SimulationConfig) -> list[Position]:
@@ -101,7 +120,7 @@ def build_scenario(config: SimulationConfig) -> tuple[list[Agent], list[Task]]:
 
 
 class Simulation:
-    """Own the logical clock, independent faults, movement, and network graph."""
+    """Own the logical clock, movement, faults, topology, and peer delivery."""
 
     def __init__(
         self,
@@ -145,6 +164,22 @@ class Simulation:
             selected_agent_ids, config.communication_range
         )
         self.communication_events: list[CommunicationEvent] = []
+        self.peer_state_stores = {
+            owner_agent_id: PeerStateStore(
+                owner_agent_id,
+                (
+                    peer_agent_id
+                    for peer_agent_id in selected_agent_ids
+                    if peer_agent_id != owner_agent_id
+                ),
+                config.peer_state_stale_after,
+            )
+            for owner_agent_id in sorted(selected_agent_ids)
+        }
+        self.peer_state_transport = PeerStateTransport(
+            self.communication_graph, self.peer_state_stores
+        )
+        self.peer_state_events: list[PeerStateEvent] = []
         self._blocked_communication_agents: set[int] = set()
         self._last_communication_update: float | None = None
         self._last_communication_event: float | None = None
@@ -261,6 +296,88 @@ class Simulation:
                 component_count=component_count,
             )
         )
+
+    def _peer_state_event(
+        self,
+        kind: PeerStateEventKind,
+        timestamp: float,
+        observer_agent_id: int,
+        peer_agent_id: int,
+    ) -> None:
+        self.peer_state_events.append(
+            PeerStateEvent(
+                kind=kind,
+                timestamp=timestamp,
+                observer_agent_id=observer_agent_id,
+                peer_agent_id=peer_agent_id,
+            )
+        )
+
+    def _stale_observation_count(self) -> int:
+        return sum(
+            len(store.stale_peer_ids) for store in self.peer_state_stores.values()
+        )
+
+    def _advance_peer_freshness(self, timestamp: float) -> None:
+        stale_transitions = 0
+        for observer_agent_id, store in sorted(self.peer_state_stores.items()):
+            for peer_agent_id in store.advance_time(timestamp):
+                stale_transitions += 1
+                self._peer_state_event(
+                    PeerStateEventKind.STALE,
+                    timestamp,
+                    observer_agent_id,
+                    peer_agent_id,
+                )
+                LOGGER.info(
+                    "[PEER] UAV %d state for UAV %d became STALE at t=%.2fs",
+                    observer_agent_id,
+                    peer_agent_id,
+                    timestamp,
+                )
+        if stale_transitions:
+            self.mission.metrics.record_peer_state_transitions(
+                timestamp,
+                stale_transitions=stale_transitions,
+                simultaneous_stale=self._stale_observation_count(),
+            )
+
+    def _deliver_peer_state(
+        self, snapshots: tuple[Heartbeat, ...], timestamp: float
+    ) -> DeliveryBatch:
+        batch = self.peer_state_transport.deliver(snapshots, timestamp)
+        self.mission.metrics.record_peer_message_batch(
+            timestamp,
+            attempted=batch.attempted,
+            delivered=batch.delivered,
+            undelivered=batch.undelivered,
+        )
+        for observer_agent_id, peer_agent_id in batch.refreshed_observations:
+            self._peer_state_event(
+                PeerStateEventKind.REFRESHED,
+                timestamp,
+                observer_agent_id,
+                peer_agent_id,
+            )
+            LOGGER.info(
+                "[PEER] UAV %d state for UAV %d refreshed at t=%.2fs",
+                observer_agent_id,
+                peer_agent_id,
+                timestamp,
+            )
+        if batch.refreshed_observations:
+            self.mission.metrics.record_peer_state_transitions(
+                timestamp,
+                refresh_transitions=len(batch.refreshed_observations),
+                simultaneous_stale=self._stale_observation_count(),
+            )
+        LOGGER.debug(
+            "[PEER] State batch at t=%.2fs: %d/%d delivered",
+            timestamp,
+            batch.delivered,
+            batch.attempted,
+        )
+        return batch
 
     def _start_communication_fault(self, timestamp: float) -> None:
         agent_id = self.config.comm_fault_agent_id
@@ -416,7 +533,7 @@ class Simulation:
         if self._has_run:
             raise RuntimeError("a Simulation instance can only run once")
         self._has_run = True
-        self.mission.start(0.0)
+        initial_snapshots = self.mission.start(0.0)
         failure_injected = False
         communication_fault_started = self.config.comm_fault_agent_id is None
         communication_fault_ended = self.config.comm_fault_agent_id is None
@@ -438,6 +555,8 @@ class Simulation:
             communication_fault_started = True
             self._update_communication_graph(0.0)
 
+        self._advance_peer_freshness(0.0)
+        self._deliver_peer_state(initial_snapshots, 0.0)
         self._complete_initial_arrivals()
         self.mission.assert_consistent()
         if self.mission.all_tasks_completed:
@@ -518,6 +637,7 @@ class Simulation:
                 communication_fault_ended = True
 
             self._update_communication_graph(timestamp, communication_positions)
+            self._advance_peer_freshness(timestamp)
 
             # Communication-only boundaries are observational. They must not
             # introduce extra task completion, allocation, or failure checks.
@@ -527,7 +647,8 @@ class Simulation:
                 continue
 
             if heartbeat_due:
-                self.mission.exchange_heartbeats(timestamp)
+                snapshots = self.mission.exchange_heartbeats(timestamp)
+                self._deliver_peer_state(snapshots, timestamp)
                 while next_heartbeat <= timestamp + epsilon:
                     next_heartbeat += self.config.heartbeat_interval
 
@@ -555,6 +676,8 @@ class Simulation:
             },
             communication_graph=self.communication_graph,
             communication_events=tuple(self.communication_events),
+            peer_state_stores=dict(self.peer_state_stores),
+            peer_state_events=tuple(self.peer_state_events),
         )
         LOGGER.info("\n%s", result.metrics.format_summary())
         return result
@@ -570,7 +693,7 @@ def configure_logging(level: str = "INFO") -> None:
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Run the EUDIS resilient swarm Prototype 0.2A simulation."
+        description="Run the EUDIS resilient swarm Prototype 0.2B simulation."
     )
     parser.add_argument("--agents", type=int, default=4, help="number of UAV agents")
     parser.add_argument("--tasks", type=int, default=20, help="number of mission tasks")
@@ -581,6 +704,12 @@ def _parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--failure-timeout", type=float, default=2.5, help="heartbeat timeout"
+    )
+    parser.add_argument(
+        "--peer-state-stale-after",
+        type=float,
+        default=2.5,
+        help="strict peer-observation freshness timeout",
     )
     parser.add_argument(
         "--communication-range",
@@ -630,6 +759,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             failure_agent_id=arguments.failure_agent,
             failure_time=arguments.failure_time,
             failure_timeout=arguments.failure_timeout,
+            peer_state_stale_after=arguments.peer_state_stale_after,
             communication_range=arguments.communication_range,
             comm_fault_agent_id=arguments.comm_fault_agent,
             comm_fault_start=arguments.comm_fault_start,

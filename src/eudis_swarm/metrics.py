@@ -54,6 +54,12 @@ class SimulationMetrics:
     total_communication_degraded_duration: float = 0.0
     network_ended_connected: bool | None = None
     healthy_unreachable_event_count: int = 0
+    peer_messages_attempted: int = 0
+    peer_messages_delivered: int = 0
+    peer_messages_undelivered: int = 0
+    peer_state_stale_transition_count: int = 0
+    peer_state_refresh_transition_count: int = 0
+    maximum_simultaneous_stale_peer_observations: int = 0
     _communication_initialized: bool = field(default=False, init=False, repr=False)
     _last_communication_update: float | None = field(
         default=None, init=False, repr=False
@@ -180,6 +186,45 @@ class SimulationMetrics:
         self._last_communication_update = timestamp
         self._previous_network_degraded = not graph.is_fully_connected
 
+    def record_peer_message_batch(
+        self,
+        timestamp: float,
+        *,
+        attempted: int,
+        delivered: int,
+        undelivered: int,
+    ) -> None:
+        """Record one graph-mediated state-publication batch."""
+
+        self._observe_time(timestamp)
+        if min(attempted, delivered, undelivered) < 0:
+            raise ValueError("peer message counts must be non-negative")
+        if attempted != delivered + undelivered:
+            raise ValueError("attempted peer messages must equal delivery outcomes")
+        self.peer_messages_attempted += attempted
+        self.peer_messages_delivered += delivered
+        self.peer_messages_undelivered += undelivered
+
+    def record_peer_state_transitions(
+        self,
+        timestamp: float,
+        *,
+        stale_transitions: int = 0,
+        refresh_transitions: int = 0,
+        simultaneous_stale: int,
+    ) -> None:
+        """Record receiver-local freshness changes without changing mission state."""
+
+        self._observe_time(timestamp)
+        if min(stale_transitions, refresh_transitions, simultaneous_stale) < 0:
+            raise ValueError("peer-state metric counts must be non-negative")
+        self.peer_state_stale_transition_count += stale_transitions
+        self.peer_state_refresh_transition_count += refresh_transitions
+        self.maximum_simultaneous_stale_peer_observations = max(
+            self.maximum_simultaneous_stale_peer_observations,
+            simultaneous_stale,
+        )
+
     def finish(self, timestamp: float, mission_completed: bool) -> None:
         timestamp = self._observe_time(timestamp)
         if self._communication_initialized and not self._communication_finalized:
@@ -300,4 +345,17 @@ class SimulationMetrics:
                     f"{self.healthy_unreachable_event_count}",
                 ]
             )
+        lines.extend(
+            [
+                "",
+                "PEER STATE (PROTOTYPE 0.2B)",
+                f"Messages attempted: {self.peer_messages_attempted}",
+                f"Messages delivered: {self.peer_messages_delivered}",
+                f"Messages undelivered: {self.peer_messages_undelivered}",
+                f"Peer stale transitions: {self.peer_state_stale_transition_count}",
+                f"Peer refresh transitions: {self.peer_state_refresh_transition_count}",
+                "Maximum simultaneous stale observations: "
+                f"{self.maximum_simultaneous_stale_peer_observations}",
+            ]
+        )
         return "\n".join(lines)

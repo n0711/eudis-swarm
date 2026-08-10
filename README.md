@@ -3,7 +3,7 @@
 EUDIS Swarm is an early-stage resilience experiment for the EUDIS Defence
 Hackathon 2026 (Autumn Edition), in the swarm coordination challenge area. The
 eventual goal is a communications-aware autonomous UAV swarm. The repository
-now contains two incremental, deterministic simulation prototypes:
+contains incremental, deterministic simulation prototypes:
 
 - **Prototype 0.1** detects one fail-stop UAV, releases its unfinished task,
   reallocates that task, and finishes the mission without human intervention.
@@ -12,10 +12,12 @@ now contains two incremental, deterministic simulation prototypes:
   physical failure recovery or task decisions.
 - **Prototype 0.2A.1** hardens configuration, logical-time, mission-lifecycle,
   invariant testing, and automated quality checks without adding swarm behavior.
+- **Prototype 0.2B** uses active one-hop graph links to deliver immutable state
+  snapshots into receiver-local `UNKNOWN` / `FRESH` / `STALE` peer views.
 
 > **Simulation only:** these prototypes are algorithmic, two-dimensional
-> point-mass simulations. The Prototype 0.2A distance threshold is an abstract
-> topology model, not an RF propagation result. Nothing here models real flight
+> point-mass simulations. The distance threshold and instantaneous one-hop state
+> delivery are abstract models, not RF or network-protocol results. Nothing models real flight
 > dynamics, radios, network transport, autopilots, sensors, collision avoidance,
 > or safety-critical operation, and it must not be interpreted as flight-ready
 > software.
@@ -67,9 +69,10 @@ Physical and communication states are deliberately independent:
 | --- | --- |
 | Physical agent state | `IDLE`, `ACTIVE`, or `FAILED` |
 | Communication state | `REACHABLE` when the UAV has at least one active peer link; `UNREACHABLE` when it is isolated |
+| Receiver-local peer knowledge | `UNKNOWN`, `FRESH`, or `STALE` independently for each remote UAV |
 
-`STALE` is not modeled because Prototype 0.2A has no packet-freshness or
-delivery model. A UAV in a disconnected component of two or more UAVs remains
+Topology itself still does not use `STALE`; Prototype 0.2B models that separately
+as receiver-local information freshness. A UAV in a disconnected component of two or more UAVs remains
 reachable to peers in that component even though the whole network is
 partitioned.
 
@@ -88,6 +91,30 @@ prevent an outage from being mistaken for a physical failure.
 See [the Prototype 0.2A technical design](docs/prototype_0_2a.md) for the exact
 graph contract, timing semantics, metrics, deterministic trace, and limitations.
 
+## What Prototype 0.2B adds
+
+At each existing heartbeat publication time, every responsive UAV produces an
+immutable state snapshot. The one-hop transport attempts to deliver that snapshot
+to each other UAV and succeeds only when their direct `CommunicationGraph` link
+is active. There is no routing, forwarding, retry, queue, latency, or stochastic
+loss model.
+
+Each receiver owns an independent peer-state store. An observation is `UNKNOWN`
+before first delivery, `FRESH` while its strict age is at most
+`peer_state_stale_after`, and `STALE` when:
+
+```text
+current_time - received_at > peer_state_stale_after
+```
+
+Physical ground truth, graph reachability, and peer-information freshness remain
+separate. `STALE`, `UNKNOWN`, and `UNREACHABLE` never imply `FAILED`. Peer views
+do not release or reassign tasks in 0.2B. The original failure detector remains
+a transitional centralized mission mechanism and does not consume peer stores.
+
+See [the Prototype 0.2B technical design](docs/prototype_0_2b.md) for the transport
+contract, deterministic outage trace, tests, metrics, and deferred work.
+
 ## Architecture
 
 | Module | Responsibility |
@@ -97,6 +124,8 @@ graph contract, timing semantics, metrics, deterministic trace, and limitations.
 | `task_allocator.py` | Replaceable greedy nearest-pair allocation policy |
 | `failure_manager.py` | Latest-heartbeat storage and strict physical-failure timeout detection |
 | `communication.py` | Abstract links, communication state, dynamic graph topology, and graph transitions |
+| `messaging.py` | Instantaneous one-hop delivery of immutable snapshots across active direct links |
+| `peer_state.py` | Receiver-local last-known observations and strict freshness transitions |
 | `mission.py` | Authoritative task/agent transitions, physical recovery, events, and invariants |
 | `simulation.py` | Scenario generation, logical clock, movement, fault schedules, graph updates, and CLI |
 | `metrics.py` | Separate physical-mission and network metrics derived from transitions |
@@ -106,8 +135,8 @@ graph contract, timing semantics, metrics, deterministic trace, and limitations.
 
 The allocator still proposes assignments using only task distance and physical
 availability. `Mission` applies them and checks bidirectional ownership. The
-communication graph neither mutates agents/tasks nor participates in that
-policy in Prototype 0.2A.
+communication and peer-state layers neither mutate agents/tasks nor participate
+in mission decisions in Prototype 0.2B.
 
 ## Requirements and installation
 
@@ -163,7 +192,7 @@ Use this command to postpone physical failure beyond the seeded mission and
 isolate the otherwise healthy UAV 2 from `t=4.00 s` through `t=8.00 s`:
 
 ```console
-python -m eudis_swarm.simulation --failure-time 100 --communication-range 130 --comm-fault-agent 2 --comm-fault-start 4 --comm-fault-end 8
+python -m eudis_swarm.simulation --failure-time 100 --communication-range 130 --comm-fault-agent 2 --comm-fault-start 4 --comm-fault-end 8 --peer-state-stale-after 2.5
 ```
 
 The 130-unit range exceeds the initial corner-layout diagonal of approximately
@@ -186,11 +215,19 @@ Expected deterministic result:
 | Communication-degraded duration | `4.00 s` |
 | Healthy-but-unreachable events | `1` |
 | Network ended connected | `YES` |
+| Peer messages attempted/delivered/undelivered | `144 / 120 / 24` |
+| Peer stale/refresh transitions | `6 / 6` |
 
 UAV 2 completes Task 19 at `t=4.00 s`, Task 15 at `t=4.75 s`, and
 Task 20 at `t=7.50 s` while its communication is blocked. It remains responsive,
 is never declared `FAILED`, and causes no task release. At `t=8.00 s`, its three
 links return and the graph reconnects.
+
+The last pre-fault snapshots involving UAV 2 arrive at `t=3.00 s`. At `t=5.75 s`,
+strict freshness expiry makes the three other UAVs' views of UAV 2 stale and also
+makes UAV 2's three remote peer views stale. Restoration occurs before the
+`t=8.00 s` delivery batch, so all six observations refresh immediately. None of
+these information transitions changes physical status or task ownership.
 
 ### Communication CLI options
 
@@ -200,6 +237,7 @@ links return and the graph reconnects.
 | `--comm-fault-agent` | omitted | UAV whose incident links are blocked; omission disables the communication fault |
 | `--comm-fault-start` | `4.0` | Logical time at which blocking starts |
 | `--comm-fault-end` | `8.0` | Logical time at which blocking ends; must be later than the start |
+| `--peer-state-stale-after` | `2.5` | Strict receiver-local snapshot freshness threshold |
 
 The existing `--agents`, `--tasks`, `--seed`, `--failure-agent`,
 `--failure-time`, `--failure-timeout`, `--visualize`, and `--log-level` options
@@ -275,16 +313,17 @@ Coverage includes the preserved allocation and fail-stop recovery tests plus:
 ### Six-agent smoke scenario
 
 ```console
-python -m eudis_swarm.simulation --agents 6 --tasks 30 --seed 7 --failure-agent 4 --failure-time 100 --communication-range 130 --comm-fault-agent 6 --comm-fault-start 3 --comm-fault-end 6
+python -m eudis_swarm.simulation --agents 6 --tasks 30 --seed 7 --failure-agent 4 --failure-time 100 --communication-range 130 --comm-fault-agent 6 --comm-fault-start 3 --comm-fault-end 6 --peer-state-stale-after 2.5
 ```
 
 The deterministic smoke run completes `30 / 30` tasks at `t=12.00 s`, with no
 physical failure or orphaned work. It begins with 15 links, falls to 10 while
 UAV 6 is isolated, loses and restores five links, remains degraded for 3.00
 seconds, and ends connected. UAV 6 completes Tasks 23, 20, and 27 during its
-communication outage.
+communication outage. Ten directed peer observations become stale at `t=4.75 s`
+and refresh at `t=6.00 s`; no false physical failure is introduced.
 
-## Network metrics
+## Network and peer-state metrics
 
 The physical mission summary remains separate from a Prototype 0.2A network
 block containing:
@@ -301,16 +340,23 @@ isolation is counted once when the state changes, not once per simulation tick.
 Physical `Agents failed` and network `Healthy but unreachable UAV events` are
 never merged.
 
+The separate `PEER STATE (PROTOTYPE 0.2B)` block reports directed delivery
+attempts, successful and link-gated undelivered messages, stale and refresh
+transitions, and the maximum number of simultaneous stale receiver-local
+observations. It does not feed mission decisions.
+
 ## Current limitations
 
 - The link model is only an inclusive Euclidean distance threshold plus an
   explicit per-UAV block. It is not RF propagation and does not calculate RSSI,
   SINR, interference, antenna effects, terrain, or weather.
-- Heartbeats are still direct in-process method calls. Links carry no packets,
-  so there is no delivery, loss, latency, jitter, bandwidth, routing, or stale
-  communication state.
-- Communication state is observational. Allocation, path planning, movement,
-  task ownership, and failure detection do not consume graph state.
+- Peer snapshots use instantaneous one-hop in-process delivery. There are no
+  queues, retries, forwarding, multi-hop routing, latency, jitter, bandwidth, or
+  stochastic packet loss.
+- Peer knowledge is informational only. Allocation, path planning, movement,
+  task ownership, and physical failure recovery do not consume it.
+- Physical fail-stop recovery still uses the transitional centralized heartbeat
+  manager; only the new receiver-local peer knowledge is graph-mediated.
 - The graph is centralized, recomputed from authoritative positions, and has no
   ground-station or coordinator-reachability anchor. In this prototype,
   `UNREACHABLE` specifically means isolated from every peer.
@@ -333,8 +379,8 @@ never merged.
   recovery.
 - **Prototype 0.2A — implemented:** explicit dynamic communication graph,
   abstract link degradation, partition, isolation, restoration, and metrics.
-- **Prototype 0.2B — not implemented:** route heartbeat/message delivery through
-  links and introduce communication-aware decisions and behavior.
+- **Prototype 0.2B — implemented:** active direct links mediate immutable peer
+  state delivery and receiver-local freshness, without adaptive behavior.
 - **Prototype 0.3 — planned:** communications-aware task allocation and path
   planning experiments.
 - **Prototype 0.4 — planned:** QUBO / quantum-simulated optimization experiments.

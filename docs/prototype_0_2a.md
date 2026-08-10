@@ -408,8 +408,8 @@ block set. Its availability flag expresses only this abstract model. Physical
 failure and communication reachability can be combined in later experiments,
 but one is never inferred from the other in Prototype 0.2A.
 
-Prototype 0.2B is not implemented. Its intended boundary is to route heartbeat
-and other message delivery through communication links and then introduce
-explicit communication-aware decisions. Until that work exists, a direct
-heartbeat received during a modeled communication outage is expected behavior,
-not a contradiction in the 0.2A implementation.
+Prototype 0.2B now builds on this graph with one-hop, graph-mediated peer state
+delivery and receiver-local freshness; see
+[the Prototype 0.2B design](prototype_0_2b.md). The centralized physical failure
+heartbeat path remains deliberately separate, and peer knowledge still does not
+drive communication-aware decisions.
