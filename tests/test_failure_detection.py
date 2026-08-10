@@ -3,9 +3,9 @@ from eudis_swarm.config import SimulationConfig
 from eudis_swarm.failure_manager import FailureManager
 from eudis_swarm.metrics import SimulationMetrics
 from eudis_swarm.mission import Mission, MissionEventKind
+from eudis_swarm.simulation import Simulation
 from eudis_swarm.task import Task, TaskStatus
 from eudis_swarm.task_allocator import TaskAllocator
-from eudis_swarm.simulation import Simulation
 
 
 def test_strict_heartbeat_timeout_declares_failure_once() -> None:
@@ -34,9 +34,10 @@ def test_strict_heartbeat_timeout_declares_failure_once() -> None:
     assert mission.metrics.failed_agent_count == 1
     assert mission.metrics.orphaned_task_count == 1
     assert mission.detect_and_recover(20.0) == []
-    assert sum(
-        event.kind is MissionEventKind.FAILURE_DECLARED for event in mission.events
-    ) == 1
+    assert (
+        sum(event.kind is MissionEventKind.FAILURE_DECLARED for event in mission.events)
+        == 1
+    )
 
 
 def test_coarse_movement_step_does_not_skip_scheduled_heartbeats() -> None:

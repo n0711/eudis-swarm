@@ -18,7 +18,7 @@ from .metrics import SimulationMetrics
 from .mission import Mission
 from .task import Task
 from .task_allocator import TaskAllocator
-
+from .validation import validate_timestamp
 
 LOGGER = logging.getLogger(__name__)
 
@@ -146,6 +146,8 @@ class Simulation:
         )
         self.communication_events: list[CommunicationEvent] = []
         self._blocked_communication_agents: set[int] = set()
+        self._last_communication_update: float | None = None
+        self._last_communication_event: float | None = None
         self._has_run = False
 
     def _record_positions(
@@ -153,12 +155,27 @@ class Simulation:
         timestamp: float,
         positions: Mapping[int, Position] | None = None,
     ) -> None:
-        for agent in sorted(self.mission.agents.values(), key=lambda item: item.agent_id):
-            position = agent.position if positions is None else positions[agent.agent_id]
+        previous = max(
+            (entries[-1][0] for entries in self._history.values()),
+            default=None,
+        )
+        timestamp = validate_timestamp(
+            timestamp,
+            previous=previous,
+            name="position-history timestamp",
+        )
+        for agent in sorted(
+            self.mission.agents.values(), key=lambda item: item.agent_id
+        ):
+            position = (
+                agent.position if positions is None else positions[agent.agent_id]
+            )
             self._history[agent.agent_id].append((timestamp, position))
 
     def _advance_agents(self, elapsed: float) -> None:
-        for agent in sorted(self.mission.agents.values(), key=lambda item: item.agent_id):
+        for agent in sorted(
+            self.mission.agents.values(), key=lambda item: item.agent_id
+        ):
             if (
                 agent.status is not AgentStatus.ACTIVE
                 or agent.current_task is None
@@ -174,7 +191,9 @@ class Simulation:
         if elapsed < 0.0:
             raise ValueError("elapsed must be non-negative")
         positions: dict[int, Position] = {}
-        for agent in sorted(self.mission.agents.values(), key=lambda item: item.agent_id):
+        for agent in sorted(
+            self.mission.agents.values(), key=lambda item: item.agent_id
+        ):
             if (
                 agent.status is not AgentStatus.ACTIVE
                 or agent.current_task is None
@@ -195,8 +214,11 @@ class Simulation:
             )
         return positions
 
-    def _complete_arrivals(self, timestamp: float) -> None:
-        for agent in sorted(self.mission.agents.values(), key=lambda item: item.agent_id):
+    def _complete_arrivals(self, timestamp: float) -> int:
+        completed = 0
+        for agent in sorted(
+            self.mission.agents.values(), key=lambda item: item.agent_id
+        ):
             if (
                 agent.status is not AgentStatus.ACTIVE
                 or agent.current_task is None
@@ -206,6 +228,14 @@ class Simulation:
             task = self.mission.tasks[agent.current_task]
             if agent.distance_to(task.position) <= self.config.completion_tolerance:
                 self.mission.complete_task(agent.agent_id, task.task_id, timestamp)
+                completed += 1
+        return completed
+
+    def _complete_initial_arrivals(self) -> None:
+        """Resolve zero-time work without introducing a movement boundary."""
+
+        while self._complete_arrivals(0.0):
+            self.mission.allocate_tasks(0.0)
 
     def _communication_event(
         self,
@@ -216,6 +246,12 @@ class Simulation:
         peer_agent_id: int | None = None,
         component_count: int | None = None,
     ) -> None:
+        timestamp = validate_timestamp(
+            timestamp,
+            previous=self._last_communication_event,
+            name="communication event timestamp",
+        )
+        self._last_communication_event = timestamp
         self.communication_events.append(
             CommunicationEvent(
                 kind=kind,
@@ -259,6 +295,11 @@ class Simulation:
         timestamp: float,
         positions: Mapping[int, Position] | None = None,
     ) -> CommunicationUpdate:
+        timestamp = validate_timestamp(
+            timestamp,
+            previous=self._last_communication_update,
+            name="communication update timestamp",
+        )
         observed_positions = (
             positions
             if positions is not None
@@ -271,6 +312,7 @@ class Simulation:
             observed_positions,
             blocked_agent_ids=self._blocked_communication_agents,
         )
+        self._last_communication_update = timestamp
         observed_unreachable_ids = (
             frozenset()
             if update.is_initial
@@ -391,21 +433,29 @@ class Simulation:
             failure_injected = self.mission.inject_failure(
                 self.config.failure_agent_id, 0.0
             )
-        if (
-            not communication_fault_started
-            and self.config.comm_fault_start <= epsilon
-        ):
+        if not communication_fault_started and self.config.comm_fault_start <= epsilon:
             self._start_communication_fault(0.0)
             communication_fault_started = True
             self._update_communication_graph(0.0)
 
-        while current_time < self.config.max_simulation_time - epsilon:
+        self._complete_initial_arrivals()
+        self.mission.assert_consistent()
+        if self.mission.all_tasks_completed:
+            self.mission.finish(0.0, True)
+
+        while (
+            not self.mission.finished
+            and current_time < self.config.max_simulation_time - epsilon
+        ):
             event_times = [
                 next_motion,
                 next_heartbeat,
                 self.config.max_simulation_time,
             ]
-            if not failure_injected and self.config.failure_time > current_time + epsilon:
+            if (
+                not failure_injected
+                and self.config.failure_time > current_time + epsilon
+            ):
                 event_times.append(self.config.failure_time)
             if (
                 not communication_fault_started
@@ -417,25 +467,24 @@ class Simulation:
                 and self.config.comm_fault_end > current_time + epsilon
             ):
                 event_times.append(self.config.comm_fault_end)
-            timestamp = round(
-                min(
-                    value
-                    for value in event_times
-                    if value > current_time + epsilon
+            timestamp = validate_timestamp(
+                round(
+                    min(
+                        value for value in event_times if value > current_time + epsilon
+                    ),
+                    12,
                 ),
-                12,
+                previous=current_time,
+                name="simulation timestamp",
             )
             current_time = timestamp
 
             motion_due = timestamp + epsilon >= next_motion
             heartbeat_due = timestamp + epsilon >= next_heartbeat
             failure_due = (
-                not failure_injected
-                and timestamp + epsilon >= self.config.failure_time
+                not failure_injected and timestamp + epsilon >= self.config.failure_time
             )
-            maximum_time_due = (
-                timestamp + epsilon >= self.config.max_simulation_time
-            )
+            maximum_time_due = timestamp + epsilon >= self.config.max_simulation_time
             legacy_boundary = (
                 motion_due or heartbeat_due or failure_due or maximum_time_due
             )
@@ -495,7 +544,7 @@ class Simulation:
                 while next_motion <= timestamp + epsilon:
                     motion_step += 1
                     next_motion = round(motion_step * self.config.time_step, 12)
-        else:
+        if not self.mission.finished:
             self.mission.finish(current_time, False)
 
         result = SimulationResult(
@@ -526,9 +575,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--agents", type=int, default=4, help="number of UAV agents")
     parser.add_argument("--tasks", type=int, default=20, help="number of mission tasks")
     parser.add_argument("--seed", type=int, default=2026, help="random seed")
-    parser.add_argument(
-        "--failure-agent", type=int, default=2, help="UAV ID to fail"
-    )
+    parser.add_argument("--failure-agent", type=int, default=2, help="UAV ID to fail")
     parser.add_argument(
         "--failure-time", type=float, default=4.0, help="failure injection time"
     )
@@ -560,7 +607,9 @@ def _parser() -> argparse.ArgumentParser:
         help="communication fault restoration time",
     )
     parser.add_argument(
-        "--visualize", action="store_true", help="show an optional final matplotlib view"
+        "--visualize",
+        action="store_true",
+        help="show an optional final matplotlib view",
     )
     parser.add_argument(
         "--log-level",

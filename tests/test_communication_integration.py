@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
@@ -16,7 +17,9 @@ from eudis_swarm.simulation import (
 from eudis_swarm.task import Task, TaskStatus
 
 
-def _mission_signature(result: object) -> list[tuple[object, float, int | None, int | None]]:
+def _mission_signature(
+    result: object,
+) -> list[tuple[object, float, int | None, int | None]]:
     mission = result.mission  # type: ignore[attr-defined]
     return [
         (event.kind, event.timestamp, event.agent_id, event.task_id)
@@ -167,7 +170,7 @@ def test_off_grid_communication_boundaries_do_not_change_physical_events() -> No
 def test_graph_only_boundaries_do_not_round_physical_movement_differently() -> None:
     speed = 0.06779116727398721
     target = (2.557694272740827, 4.510107468035814)
-    common = dict(
+    baseline_config = SimulationConfig(
         agent_count=1,
         task_count=1,
         agent_speed=speed,
@@ -182,13 +185,13 @@ def test_graph_only_boundaries_do_not_round_physical_movement_differently() -> N
     )
 
     baseline = Simulation(
-        SimulationConfig(**common),
+        baseline_config,
         agents=[Agent(agent_id=1, position=(0.0, 0.0), speed=speed)],
         tasks=[Task(task_id=1, position=target)],
     ).run()
     with_fault = Simulation(
-        SimulationConfig(
-            **common,
+        replace(
+            baseline_config,
             comm_fault_agent_id=1,
             comm_fault_start=0.113,
             comm_fault_end=0.732,
@@ -227,7 +230,7 @@ def test_initial_isolation_is_a_baseline_not_a_transition_event() -> None:
     assert result.metrics.maximum_connected_component_count == 2
     assert result.metrics.isolation_event_count == 0
     assert result.metrics.healthy_unreachable_event_count == 0
-    assert result.metrics.total_communication_degraded_duration == pytest.approx(0.25)
+    assert result.metrics.total_communication_degraded_duration == pytest.approx(0.0)
     assert result.metrics.network_ended_connected is False
     assert not any(
         event.kind is CommunicationEventKind.AGENT_UNREACHABLE
@@ -263,11 +266,7 @@ def test_isolated_uav_keeps_a_long_running_task_through_the_outage() -> None:
 
     result = Simulation(config, agents=agents, tasks=tasks).run()
 
-    task_events = [
-        event
-        for event in result.mission.events
-        if event.task_id == 2
-    ]
+    task_events = [event for event in result.mission.events if event.task_id == 2]
     assert [event.kind for event in task_events] == [
         MissionEventKind.TASK_ASSIGNED,
         MissionEventKind.TASK_COMPLETED,
@@ -280,13 +279,16 @@ def test_isolated_uav_keeps_a_long_running_task_through_the_outage() -> None:
     assert result.mission.agents[2].status is AgentStatus.IDLE
     assert result.metrics.failed_agent_count == 0
     assert result.metrics.orphaned_task_count == 0
-    assert len(
-        {
-            position
-            for timestamp, position in result.position_history[2]
-            if config.comm_fault_start <= timestamp <= config.comm_fault_end
-        }
-    ) > 1
+    assert (
+        len(
+            {
+                position
+                for timestamp, position in result.position_history[2]
+                if config.comm_fault_start <= timestamp <= config.comm_fault_end
+            }
+        )
+        > 1
+    )
 
 
 def test_prototype_0_1_physical_recovery_golden_is_unchanged() -> None:

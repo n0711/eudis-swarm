@@ -42,7 +42,9 @@ class CommunicationLink:
                 "communication link endpoints must use increasing canonical order"
             )
         if not isfinite(self.distance) or self.distance < 0.0:
-            raise ValueError("communication link distance must be finite and non-negative")
+            raise ValueError(
+                "communication link distance must be finite and non-negative"
+            )
         if not isinstance(self.available, bool):
             raise TypeError("communication link availability must be boolean")
 
@@ -88,16 +90,12 @@ class CommunicationGraph:
     initially isolated UAVs are not counted as new isolation events.
     """
 
-    def __init__(
-        self, agent_ids: Iterable[int], communication_range: float
-    ) -> None:
+    def __init__(self, agent_ids: Iterable[int], communication_range: float) -> None:
         supplied_ids = tuple(agent_ids)
         if not supplied_ids:
             raise ValueError("communication graph requires at least one UAV")
         if any(
-            not isinstance(agent_id, int)
-            or isinstance(agent_id, bool)
-            or agent_id <= 0
+            not isinstance(agent_id, int) or isinstance(agent_id, bool) or agent_id <= 0
             for agent_id in supplied_ids
         ):
             raise ValueError("communication graph UAV IDs must be positive integers")
@@ -154,7 +152,9 @@ class CommunicationGraph:
     def link_count(self) -> int:
         return len(self.active_links)
 
-    def link_between(self, left_agent_id: int, right_agent_id: int) -> CommunicationLink:
+    def link_between(
+        self, left_agent_id: int, right_agent_id: int
+    ) -> CommunicationLink:
         """Return the current canonical pair record for two distinct UAVs."""
 
         self._require_initialized()
@@ -162,7 +162,8 @@ class CommunicationGraph:
         self._require_known_agent(right_agent_id)
         if left_agent_id == right_agent_id:
             raise ValueError("a UAV does not have a communication link to itself")
-        key = tuple(sorted((left_agent_id, right_agent_id)))
+        source_agent_id, destination_agent_id = sorted((left_agent_id, right_agent_id))
+        key = (source_agent_id, destination_agent_id)
         return self._links[key]
 
     def neighbors(self, agent_id: int) -> frozenset[int]:
@@ -206,11 +207,15 @@ class CommunicationGraph:
 
         self._validate_positions(positions)
         blocked = frozenset(blocked_agent_ids)
+        if any(
+            not isinstance(agent_id, int) or isinstance(agent_id, bool)
+            for agent_id in blocked
+        ):
+            raise ValueError("blocked_agent_ids must contain integer UAV IDs")
         unknown_blocked = blocked - self._agent_id_set
         if unknown_blocked:
             raise ValueError(
-                "blocked_agent_ids contains unknown UAV IDs: "
-                f"{sorted(unknown_blocked)}"
+                f"blocked_agent_ids contains unknown UAV IDs: {sorted(unknown_blocked)}"
             )
 
         new_links: dict[tuple[int, int], CommunicationLink] = {}
@@ -234,14 +239,10 @@ class CommunicationGraph:
             )
             new_links[link.key] = link
 
-        new_active_keys = {
-            key for key, link in new_links.items() if link.available
-        }
+        new_active_keys = {key for key, link in new_links.items() if link.available}
         new_neighbors, new_components = self._build_topology(new_active_keys)
         new_isolated = frozenset(
-            agent_id
-            for agent_id, peers in new_neighbors.items()
-            if not peers
+            agent_id for agent_id, peers in new_neighbors.items() if not peers
         )
         new_fully_connected = len(new_components) == 1
 
@@ -250,12 +251,10 @@ class CommunicationGraph:
                 key for key, link in self._links.items() if link.available
             }
             lost_links = tuple(
-                new_links[key]
-                for key in sorted(previous_active_keys - new_active_keys)
+                new_links[key] for key in sorted(previous_active_keys - new_active_keys)
             )
             restored_links = tuple(
-                new_links[key]
-                for key in sorted(new_active_keys - previous_active_keys)
+                new_links[key] for key in sorted(new_active_keys - previous_active_keys)
             )
             newly_isolated = tuple(sorted(new_isolated - self._isolated_agent_ids))
             newly_reachable = tuple(sorted(self._isolated_agent_ids - new_isolated))
@@ -318,8 +317,7 @@ class CommunicationGraph:
             components.append(frozenset(component))
 
         neighbors = {
-            agent_id: frozenset(peers)
-            for agent_id, peers in mutable_neighbors.items()
+            agent_id: frozenset(peers) for agent_id, peers in mutable_neighbors.items()
         }
         return neighbors, tuple(components)
 
@@ -350,7 +348,11 @@ class CommunicationGraph:
             raise RuntimeError("communication graph has not been updated")
 
     def _require_known_agent(self, agent_id: int) -> None:
-        if agent_id not in self._agent_id_set:
+        if (
+            not isinstance(agent_id, int)
+            or isinstance(agent_id, bool)
+            or agent_id not in self._agent_id_set
+        ):
             raise KeyError(f"unknown UAV ID {agent_id}")
 
 

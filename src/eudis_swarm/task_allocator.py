@@ -19,7 +19,9 @@ class Allocation:
 class TaskAllocator:
     """Greedily select globally nearest available UAV/task pairs."""
 
-    def allocate(self, agents: Iterable[Agent], tasks: Iterable[Task]) -> list[Allocation]:
+    def allocate(
+        self, agents: Iterable[Agent], tasks: Iterable[Task]
+    ) -> list[Allocation]:
         """Propose unique assignments without mutating mission state."""
 
         candidates_agents = {

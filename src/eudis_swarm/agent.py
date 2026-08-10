@@ -5,8 +5,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import Enum
 from math import hypot, isfinite
+from numbers import Real
 from typing import TypeAlias
 
+from .validation import validate_positive_integer, validate_timestamp
 
 Position: TypeAlias = tuple[float, float]
 
@@ -29,6 +31,15 @@ class Heartbeat:
     current_task: int | None
     timestamp: float
 
+    def __post_init__(self) -> None:
+        validate_positive_integer(self.agent_id, name="agent_id")
+        if len(self.position) != 2 or not all(
+            isinstance(value, Real) and not isinstance(value, bool) and isfinite(value)
+            for value in self.position
+        ):
+            raise ValueError("position must contain two finite coordinates")
+        validate_timestamp(self.timestamp)
+
 
 @dataclass(slots=True)
 class Agent:
@@ -44,11 +55,18 @@ class Agent:
     failure_injected_at: float | None = None
 
     def __post_init__(self) -> None:
-        if self.agent_id <= 0:
-            raise ValueError("agent_id must be greater than zero")
-        if len(self.position) != 2 or not all(isfinite(value) for value in self.position):
+        validate_positive_integer(self.agent_id, name="agent_id")
+        if len(self.position) != 2 or not all(
+            isinstance(value, Real) and not isinstance(value, bool) and isfinite(value)
+            for value in self.position
+        ):
             raise ValueError("position must contain two finite coordinates")
-        if not isfinite(self.speed) or self.speed <= 0.0:
+        if (
+            not isinstance(self.speed, Real)
+            or isinstance(self.speed, bool)
+            or not isfinite(self.speed)
+            or self.speed <= 0.0
+        ):
             raise ValueError("speed must be finite and greater than zero")
 
     @property
@@ -61,12 +79,14 @@ class Agent:
         return hypot(target[0] - self.position[0], target[1] - self.position[1])
 
     def assign_task(self, task_id: int) -> None:
+        validate_positive_integer(task_id, name="task_id")
         if not self.available:
             raise ValueError(f"UAV {self.agent_id} is not available")
         self.current_task = task_id
         self.status = AgentStatus.ACTIVE
 
     def release_task(self, task_id: int) -> None:
+        validate_positive_integer(task_id, name="task_id")
         if self.current_task != task_id:
             raise ValueError(f"UAV {self.agent_id} does not own Task {task_id}")
         self.current_task = None
@@ -79,8 +99,7 @@ class Agent:
     def move_toward(self, target: Position, elapsed: float) -> None:
         """Advance toward a target using a constant-speed point update."""
 
-        if elapsed < 0.0:
-            raise ValueError("elapsed must be non-negative")
+        elapsed = validate_timestamp(elapsed, previous=0.0, name="elapsed")
         if not self.responsive or self.status is AgentStatus.FAILED:
             return
 
@@ -97,6 +116,7 @@ class Agent:
     def send_heartbeat(self, timestamp: float) -> Heartbeat | None:
         """Return a state snapshot, or nothing after a physical failure."""
 
+        timestamp = validate_timestamp(timestamp, previous=self.last_heartbeat)
         if not self.responsive or self.status is AgentStatus.FAILED:
             return None
         self.last_heartbeat = timestamp
@@ -111,6 +131,7 @@ class Agent:
     def inject_failure(self, timestamp: float) -> bool:
         """Make the UAV silent and immobile without declaring it failed."""
 
+        timestamp = validate_timestamp(timestamp, previous=self.last_heartbeat)
         if not self.responsive or self.status is AgentStatus.FAILED:
             return False
         self.responsive = False
