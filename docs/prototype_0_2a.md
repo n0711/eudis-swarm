@@ -331,6 +331,22 @@ Run all tests:
 python -m pytest
 ```
 
+Prototype 0.2A.1 adds the following quality checks without changing the
+observational communications model:
+
+```console
+python -m ruff check .
+python -m ruff format --check .
+python -m pyright
+python -m pytest --cov=eudis_swarm --cov-report=term-missing
+```
+
+The coverage threshold is 85%. CI runs these checks, a package build, and an
+installed CLI smoke test on Python 3.11 and 3.13. Runtime hardening rejects
+invalid/non-finite configuration and backwards logical time, restricts mission
+operations to the `RUNNING` lifecycle, and completes initially satisfied work
+at `t=0.00 s`.
+
 The complete suite retains Prototype 0.1 allocation, timeout, scheduling, and
 mission-recovery coverage and adds tests for:
 

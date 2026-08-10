@@ -7,6 +7,7 @@ from statistics import fmean
 from typing import TYPE_CHECKING, Collection
 
 from .agent import Position
+from .validation import validate_timestamp
 
 if TYPE_CHECKING:
     from .communication import CommunicationGraph, CommunicationUpdate
@@ -59,10 +60,21 @@ class SimulationMetrics:
     )
     _previous_network_degraded: bool = field(default=False, init=False, repr=False)
     _communication_finalized: bool = field(default=False, init=False, repr=False)
+    _last_event_time: float | None = field(default=None, init=False, repr=False)
+
+    def _observe_time(self, timestamp: float) -> float:
+        value = validate_timestamp(
+            timestamp,
+            previous=self._last_event_time,
+            name="metrics timestamp",
+        )
+        self._last_event_time = value
+        return value
 
     def record_failure_injection(
         self, agent_id: int, timestamp: float, position: Position
     ) -> None:
+        timestamp = self._observe_time(timestamp)
         record = self.failures.setdefault(agent_id, FailureRecord(agent_id=agent_id))
         if record.injected_at is None:
             record.injected_at = timestamp
@@ -71,12 +83,23 @@ class SimulationMetrics:
     def record_failure_detection(
         self, agent_id: int, timestamp: float, last_heartbeat: float
     ) -> None:
+        last_heartbeat = validate_timestamp(
+            last_heartbeat,
+            name="last heartbeat timestamp",
+        )
+        timestamp = validate_timestamp(timestamp, name="metrics timestamp")
+        if last_heartbeat > timestamp:
+            raise ValueError("last heartbeat timestamp cannot follow detection")
+        timestamp = self._observe_time(timestamp)
         record = self.failures.setdefault(agent_id, FailureRecord(agent_id=agent_id))
         if record.detected_at is None:
             record.detected_at = timestamp
             record.last_heartbeat = last_heartbeat
 
-    def record_orphan(self, task_id: int, failed_agent_id: int, timestamp: float) -> None:
+    def record_orphan(
+        self, task_id: int, failed_agent_id: int, timestamp: float
+    ) -> None:
+        timestamp = self._observe_time(timestamp)
         self.recoveries.setdefault(
             task_id,
             RecoveryRecord(
@@ -86,7 +109,10 @@ class SimulationMetrics:
             ),
         )
 
-    def record_reassignment(self, task_id: int, agent_id: int, timestamp: float) -> None:
+    def record_reassignment(
+        self, task_id: int, agent_id: int, timestamp: float
+    ) -> None:
+        timestamp = self._observe_time(timestamp)
         recovery = self.recoveries[task_id]
         if recovery.reassigned_agent_id is None:
             if agent_id == recovery.failed_agent_id:
@@ -95,6 +121,7 @@ class SimulationMetrics:
             recovery.reassigned_at = timestamp
 
     def record_task_completion(self, task_id: int, timestamp: float) -> None:
+        timestamp = self._observe_time(timestamp)
         self.completed_task_ids.add(task_id)
         recovery = self.recoveries.get(task_id)
         if recovery is not None and recovery.completed_at is None:
@@ -111,6 +138,7 @@ class SimulationMetrics:
 
         if self._communication_finalized:
             raise RuntimeError("communication metrics have already been finalized")
+        timestamp = self._observe_time(timestamp)
 
         component_count = len(graph.connected_components)
         healthy_unreachable_count = len(set(healthy_unreachable_agent_ids))
@@ -131,9 +159,7 @@ class SimulationMetrics:
         if timestamp < previous_timestamp:
             raise ValueError("communication update timestamps must be non-decreasing")
         if self._previous_network_degraded:
-            self.total_communication_degraded_duration += (
-                timestamp - previous_timestamp
-            )
+            self.total_communication_degraded_duration += timestamp - previous_timestamp
 
         if self.minimum_link_count is None:
             self.minimum_link_count = graph.link_count
@@ -155,6 +181,7 @@ class SimulationMetrics:
         self._previous_network_degraded = not graph.is_fully_connected
 
     def finish(self, timestamp: float, mission_completed: bool) -> None:
+        timestamp = self._observe_time(timestamp)
         if self._communication_initialized and not self._communication_finalized:
             previous_timestamp = self._last_communication_update
             if previous_timestamp is None:

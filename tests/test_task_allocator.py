@@ -11,7 +11,10 @@ def test_allocator_assigns_unique_tasks_and_excludes_failed_uav() -> None:
     failed = Agent(agent_id=2, position=(10.0, 0.0), speed=1.0)
     healthy_right = Agent(agent_id=3, position=(20.0, 0.0), speed=1.0)
     failed.declare_failed()
-    tasks = [Task(task_id=1, position=(1.0, 0.0)), Task(task_id=2, position=(11.0, 0.0))]
+    tasks = [
+        Task(task_id=1, position=(1.0, 0.0)),
+        Task(task_id=2, position=(11.0, 0.0)),
+    ]
     metrics = SimulationMetrics(total_task_count=2, agents_started=3)
     mission = Mission(
         agents=[healthy_left, failed, healthy_right],

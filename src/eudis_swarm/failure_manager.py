@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from math import isfinite
+from numbers import Real
 from typing import Iterable
 
 from .agent import Agent, AgentStatus, Heartbeat
+from .validation import validate_timestamp
 
 
 @dataclass(frozen=True, slots=True)
@@ -20,11 +23,17 @@ class FailureManager:
     """Detect silent agents without owning mission/task transitions."""
 
     def __init__(self, heartbeat_timeout: float) -> None:
-        if heartbeat_timeout <= 0.0:
-            raise ValueError("heartbeat_timeout must be greater than zero")
-        self.heartbeat_timeout = heartbeat_timeout
+        if (
+            not isinstance(heartbeat_timeout, Real)
+            or isinstance(heartbeat_timeout, bool)
+            or not isfinite(heartbeat_timeout)
+            or heartbeat_timeout <= 0.0
+        ):
+            raise ValueError("heartbeat_timeout must be finite and greater than zero")
+        self.heartbeat_timeout = float(heartbeat_timeout)
         self._heartbeats: dict[int, Heartbeat] = {}
         self._detected_agents: set[int] = set()
+        self._last_detection_time: float | None = None
 
     @property
     def heartbeats(self) -> dict[int, Heartbeat]:
@@ -32,8 +41,11 @@ class FailureManager:
 
     def record_heartbeat(self, heartbeat: Heartbeat) -> None:
         previous = self._heartbeats.get(heartbeat.agent_id)
-        if previous is not None and heartbeat.timestamp < previous.timestamp:
-            raise ValueError("heartbeat timestamps must be monotonic per agent")
+        validate_timestamp(
+            heartbeat.timestamp,
+            previous=None if previous is None else previous.timestamp,
+            name="heartbeat timestamp",
+        )
         self._heartbeats[heartbeat.agent_id] = heartbeat
 
     def detect_timeouts(
@@ -41,6 +53,21 @@ class FailureManager:
     ) -> list[HeartbeatTimeout]:
         """Return each newly stale agent once, using strict ``>`` semantics."""
 
+        timestamp = validate_timestamp(
+            timestamp,
+            previous=self._last_detection_time,
+            name="failure detection timestamp",
+        )
+        latest_heartbeat = max(
+            (heartbeat.timestamp for heartbeat in self._heartbeats.values()),
+            default=None,
+        )
+        validate_timestamp(
+            timestamp,
+            previous=latest_heartbeat,
+            name="failure detection timestamp",
+        )
+        self._last_detection_time = timestamp
         timeouts: list[HeartbeatTimeout] = []
         for agent in sorted(agents, key=lambda item: item.agent_id):
             if (

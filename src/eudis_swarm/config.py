@@ -4,6 +4,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from math import isfinite
+from numbers import Real
+
+from .validation import validate_positive_integer
 
 
 @dataclass(frozen=True, slots=True)
@@ -29,13 +32,15 @@ class SimulationConfig:
     comm_fault_end: float = 8.0
 
     def __post_init__(self) -> None:
-        positive_ints = {
-            "agent_count": self.agent_count,
-            "task_count": self.task_count,
-        }
-        for name, value in positive_ints.items():
-            if value <= 0:
-                raise ValueError(f"{name} must be greater than zero")
+        validate_positive_integer(self.agent_count, name="agent_count")
+        validate_positive_integer(self.task_count, name="task_count")
+        validate_positive_integer(self.failure_agent_id, name="failure_agent_id")
+        if not isinstance(self.random_seed, int) or isinstance(self.random_seed, bool):
+            raise ValueError("random_seed must be an integer")
+        if self.comm_fault_agent_id is not None:
+            validate_positive_integer(
+                self.comm_fault_agent_id, name="comm_fault_agent_id"
+            )
 
         positive_floats = {
             "area_width": self.area_width,
@@ -48,17 +53,29 @@ class SimulationConfig:
             "communication_range": self.communication_range,
         }
         for name, value in positive_floats.items():
-            if not isfinite(value) or value <= 0.0:
+            if (
+                not isinstance(value, Real)
+                or isinstance(value, bool)
+                or not isfinite(value)
+                or value <= 0.0
+            ):
                 raise ValueError(f"{name} must be finite and greater than zero")
 
-        if not isfinite(self.completion_tolerance) or self.completion_tolerance < 0.0:
-            raise ValueError("completion_tolerance must be finite and non-negative")
-        if not isfinite(self.failure_time) or self.failure_time < 0.0:
-            raise ValueError("failure_time must be finite and non-negative")
-        if not isfinite(self.comm_fault_start) or self.comm_fault_start < 0.0:
-            raise ValueError("comm_fault_start must be finite and non-negative")
-        if not isfinite(self.comm_fault_end) or self.comm_fault_end < 0.0:
-            raise ValueError("comm_fault_end must be finite and non-negative")
+        non_negative_floats = {
+            "completion_tolerance": self.completion_tolerance,
+            "failure_time": self.failure_time,
+            "comm_fault_start": self.comm_fault_start,
+            "comm_fault_end": self.comm_fault_end,
+        }
+        for name, value in non_negative_floats.items():
+            if (
+                not isinstance(value, Real)
+                or isinstance(value, bool)
+                or not isfinite(value)
+                or value < 0.0
+            ):
+                raise ValueError(f"{name} must be finite and non-negative")
+
         if self.comm_fault_end <= self.comm_fault_start:
             raise ValueError("comm_fault_end must be greater than comm_fault_start")
         if self.failure_timeout < self.heartbeat_interval:

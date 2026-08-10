@@ -10,6 +10,8 @@ now contains two incremental, deterministic simulation prototypes:
 - **Prototype 0.2A** adds an explicit, time-varying communications graph and a
   deterministic communication outage/restoration experiment without changing
   physical failure recovery or task decisions.
+- **Prototype 0.2A.1** hardens configuration, logical-time, mission-lifecycle,
+  invariant testing, and automated quality checks without adding swarm behavior.
 
 > **Simulation only:** these prototypes are algorithmic, two-dimensional
 > point-mass simulations. The Prototype 0.2A distance threshold is an abstract
@@ -99,6 +101,7 @@ graph contract, timing semantics, metrics, deterministic trace, and limitations.
 | `simulation.py` | Scenario generation, logical clock, movement, fault schedules, graph updates, and CLI |
 | `metrics.py` | Separate physical-mission and network metrics derived from transitions |
 | `config.py` | Validated physical and communication configuration |
+| `validation.py` | Shared finite, monotonic logical-time and identifier validation |
 | `visualization.py` | Optional final matplotlib rendering, isolated from the headless core |
 
 The allocator still proposes assignments using only task distance and physical
@@ -109,7 +112,7 @@ policy in Prototype 0.2A.
 ## Requirements and installation
 
 - Python 3.11 or newer
-- `pytest` only for development/tests
+- `pytest`, coverage, Ruff, Pyright, and build tooling in the `dev` extra
 - `matplotlib` only for the optional visualisation
 
 The headless simulator has no third-party runtime dependencies. From the
@@ -229,6 +232,26 @@ Equality at `t=5.50 s` does not fire. Detection and Task 19 release occur at
 ```console
 python -m pytest
 ```
+
+Run the complete local quality baseline with:
+
+```console
+python -m ruff check .
+python -m ruff format --check .
+python -m pyright
+python -m pytest --cov=eudis_swarm --cov-report=term-missing
+python -m build
+```
+
+Coverage has an initial 85% branch-aware threshold. GitHub Actions runs the
+same lint, formatting, type, test, coverage, build, and installed-CLI checks on
+Python 3.11 and 3.13 for pushes and pull requests involving `main`.
+
+Configuration rejects booleans where integer counts or UAV IDs are required,
+non-finite numeric values, invalid ranges, and illogical fault windows. Mission
+operations are legal only while the lifecycle is `RUNNING`, and timestamps must
+remain finite and monotonic. Tasks already satisfied at mission start complete
+at `t=0.00 s` without an artificial movement tick.
 
 For individual test names:
 

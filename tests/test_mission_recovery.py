@@ -56,6 +56,9 @@ def test_failed_uav_task_is_reassigned_and_mission_completes() -> None:
     assert failure.injected_at == pytest.approx(1.0)
     assert failure.detected_at == pytest.approx(2.0)
     assert failure.last_heartbeat == pytest.approx(0.5)
+    assert failure.detected_at is not None
+    assert failure.last_heartbeat is not None
+    assert failure.injected_at is not None
     assert failure.detected_at - failure.last_heartbeat > config.failure_timeout
     assert orphan.orphaned_at == failure.detected_at
     assert orphan.reassigned_at == orphan.orphaned_at
@@ -102,8 +105,14 @@ def test_default_scenario_is_reproducible() -> None:
 
     assert first_signature == second_signature
     assert first.metrics.simulation_duration == second.metrics.simulation_duration
-    assert first.metrics.failure_detection_latencies == second.metrics.failure_detection_latencies
-    assert first.metrics.task_reassignment_latencies == second.metrics.task_reassignment_latencies
+    assert (
+        first.metrics.failure_detection_latencies
+        == second.metrics.failure_detection_latencies
+    )
+    assert (
+        first.metrics.task_reassignment_latencies
+        == second.metrics.task_reassignment_latencies
+    )
     assert first.metrics.mission_completed is True
     assert first.metrics.completed_task_count == 20
     assert first.metrics.failed_agent_count == 1

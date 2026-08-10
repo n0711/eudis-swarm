@@ -78,7 +78,9 @@ def show_result(result: SimulationResult, config: SimulationConfig) -> None:
             marker="X" if failed else ("s" if unreachable else "^"),
             s=120,
             color=(
-                "firebrick" if failed else ("darkorange" if unreachable else "royalblue")
+                "firebrick"
+                if failed
+                else ("darkorange" if unreachable else "royalblue")
             ),
             zorder=3,
         )

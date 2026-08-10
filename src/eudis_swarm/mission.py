@@ -12,7 +12,7 @@ from .failure_manager import FailureManager, HeartbeatTimeout
 from .metrics import SimulationMetrics
 from .task import Task, TaskStatus
 from .task_allocator import Allocation, TaskAllocator
-
+from .validation import validate_timestamp
 
 LOGGER = logging.getLogger(__name__)
 
@@ -28,6 +28,15 @@ class MissionEventKind(str, Enum):
     TASK_COMPLETED = "TASK_COMPLETED"
     MISSION_COMPLETED = "MISSION_COMPLETED"
     MISSION_TIMED_OUT = "MISSION_TIMED_OUT"
+
+
+class MissionState(str, Enum):
+    """Minimal lifecycle for legal mission operations."""
+
+    CREATED = "CREATED"
+    RUNNING = "RUNNING"
+    COMPLETED = "COMPLETED"
+    TIMED_OUT = "TIMED_OUT"
 
 
 @dataclass(frozen=True, slots=True)
@@ -60,8 +69,33 @@ class Mission:
         self.failure_manager = failure_manager
         self.metrics = metrics
         self.events: list[MissionEvent] = []
-        self.started = False
-        self.finished = False
+        self._state = MissionState.CREATED
+        self._last_timestamp: float | None = None
+
+    @property
+    def state(self) -> MissionState:
+        return self._state
+
+    @property
+    def started(self) -> bool:
+        return self.state is not MissionState.CREATED
+
+    @property
+    def finished(self) -> bool:
+        return self.state in {MissionState.COMPLETED, MissionState.TIMED_OUT}
+
+    def _require_running(self) -> None:
+        if self.state is not MissionState.RUNNING:
+            raise RuntimeError("mission operations require a running mission")
+
+    def _observe_time(self, timestamp: float) -> float:
+        value = validate_timestamp(
+            timestamp,
+            previous=self._last_timestamp,
+            name="mission timestamp",
+        )
+        self._last_timestamp = value
+        return value
 
     def _event(
         self,
@@ -83,9 +117,10 @@ class Mission:
         )
 
     def start(self, timestamp: float = 0.0) -> None:
-        if self.started:
+        if self.state is not MissionState.CREATED:
             raise RuntimeError("mission has already started")
-        self.started = True
+        timestamp = self._observe_time(timestamp)
+        self._state = MissionState.RUNNING
         self.metrics.start_time = timestamp
         LOGGER.info(
             "[MISSION] Mission started with %d agents and %d tasks",
@@ -98,12 +133,16 @@ class Mission:
         self.assert_consistent()
 
     def exchange_heartbeats(self, timestamp: float) -> None:
+        self._require_running()
+        timestamp = self._observe_time(timestamp)
         for agent in sorted(self.agents.values(), key=lambda item: item.agent_id):
             heartbeat = agent.send_heartbeat(timestamp)
             if heartbeat is not None:
                 self.failure_manager.record_heartbeat(heartbeat)
 
     def inject_failure(self, agent_id: int, timestamp: float) -> bool:
+        self._require_running()
+        timestamp = self._observe_time(timestamp)
         agent = self.agents[agent_id]
         if not agent.inject_failure(timestamp):
             return False
@@ -152,14 +191,14 @@ class Mission:
             LOGGER.info("[ALLOC] Task %d -> UAV %d", task.task_id, agent.agent_id)
 
     def allocate_tasks(self, timestamp: float) -> list[Allocation]:
+        self._require_running()
+        timestamp = self._observe_time(timestamp)
         allocations = self.allocator.allocate(self.agents.values(), self.tasks.values())
         for allocation in allocations:
             self._apply_allocation(allocation, timestamp)
         return allocations
 
-    def _declare_and_release(
-        self, timeout: HeartbeatTimeout, timestamp: float
-    ) -> None:
+    def _declare_and_release(self, timeout: HeartbeatTimeout, timestamp: float) -> None:
         agent = self.agents[timeout.agent_id]
         self.metrics.record_failure_detection(
             agent.agent_id, timestamp, timeout.last_heartbeat
@@ -190,7 +229,10 @@ class Mission:
         task = self.tasks[timeout.task_id]
         if task.status is TaskStatus.COMPLETED:
             return
-        if task.status is not TaskStatus.ASSIGNED or task.assigned_agent != agent.agent_id:
+        if (
+            task.status is not TaskStatus.ASSIGNED
+            or task.assigned_agent != agent.agent_id
+        ):
             raise RuntimeError("failed UAV/task ownership is inconsistent")
         task.release()
         agent.release_task(task.task_id)
@@ -208,9 +250,9 @@ class Mission:
         )
 
     def detect_and_recover(self, timestamp: float) -> list[HeartbeatTimeout]:
-        timeouts = self.failure_manager.detect_timeouts(
-            self.agents.values(), timestamp
-        )
+        self._require_running()
+        timestamp = self._observe_time(timestamp)
+        timeouts = self.failure_manager.detect_timeouts(self.agents.values(), timestamp)
         for timeout in timeouts:
             self._declare_and_release(timeout, timestamp)
         if timeouts:
@@ -219,6 +261,8 @@ class Mission:
         return timeouts
 
     def complete_task(self, agent_id: int, task_id: int, timestamp: float) -> None:
+        self._require_running()
+        timestamp = self._observe_time(timestamp)
         agent = self.agents[agent_id]
         task = self.tasks[task_id]
         task.complete(agent_id)
@@ -240,10 +284,10 @@ class Mission:
         )
 
     def finish(self, timestamp: float, completed: bool) -> None:
-        if self.finished:
-            return
-        self.finished = True
+        self._require_running()
+        timestamp = self._observe_time(timestamp)
         self.metrics.finish(timestamp, completed)
+        self._state = MissionState.COMPLETED if completed else MissionState.TIMED_OUT
         if completed:
             self._event(MissionEventKind.MISSION_COMPLETED, timestamp)
             LOGGER.info("[MISSION] Mission completed at t=%.2fs", timestamp)
