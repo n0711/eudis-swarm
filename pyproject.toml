@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "eudis-swarm"
+version = "0.1.0"
+description = "Deterministic resilience simulation for an autonomous multi-UAV swarm"
+readme = "README.md"
+requires-python = ">=3.11"
+authors = [{ name = "n0711" }]
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest>=8,<10"]
+visualization = ["matplotlib>=3.8"]
+
+[project.scripts]
+eudis-swarm = "eudis_swarm.simulation:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+addopts = "-q"
+testpaths = ["tests"]

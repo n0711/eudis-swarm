@@ -1,0 +1,283 @@
+"""Mission ownership transitions and resilience coordination."""
+
+from __future__ import annotations
+
+import logging
+from dataclasses import dataclass
+from enum import Enum
+from typing import Iterable
+
+from .agent import Agent, AgentStatus, Position
+from .failure_manager import FailureManager, HeartbeatTimeout
+from .metrics import SimulationMetrics
+from .task import Task, TaskStatus
+from .task_allocator import Allocation, TaskAllocator
+
+
+LOGGER = logging.getLogger(__name__)
+
+
+class MissionEventKind(str, Enum):
+    MISSION_STARTED = "MISSION_STARTED"
+    TASK_ASSIGNED = "TASK_ASSIGNED"
+    FAILURE_INJECTED = "FAILURE_INJECTED"
+    HEARTBEAT_TIMEOUT = "HEARTBEAT_TIMEOUT"
+    FAILURE_DECLARED = "FAILURE_DECLARED"
+    TASK_RELEASED = "TASK_RELEASED"
+    TASK_REASSIGNED = "TASK_REASSIGNED"
+    TASK_COMPLETED = "TASK_COMPLETED"
+    MISSION_COMPLETED = "MISSION_COMPLETED"
+    MISSION_TIMED_OUT = "MISSION_TIMED_OUT"
+
+
+@dataclass(frozen=True, slots=True)
+class MissionEvent:
+    kind: MissionEventKind
+    timestamp: float
+    agent_id: int | None = None
+    task_id: int | None = None
+    position: Position | None = None
+
+
+class Mission:
+    """Own all state changes spanning agents and tasks."""
+
+    def __init__(
+        self,
+        agents: Iterable[Agent],
+        tasks: Iterable[Task],
+        allocator: TaskAllocator,
+        failure_manager: FailureManager,
+        metrics: SimulationMetrics,
+    ) -> None:
+        self.agents = {agent.agent_id: agent for agent in agents}
+        self.tasks = {task.task_id: task for task in tasks}
+        if len(self.agents) != metrics.agents_started:
+            raise ValueError("agent IDs must be unique and match metrics")
+        if len(self.tasks) != metrics.total_task_count:
+            raise ValueError("task IDs must be unique and match metrics")
+        self.allocator = allocator
+        self.failure_manager = failure_manager
+        self.metrics = metrics
+        self.events: list[MissionEvent] = []
+        self.started = False
+        self.finished = False
+
+    def _event(
+        self,
+        kind: MissionEventKind,
+        timestamp: float,
+        *,
+        agent_id: int | None = None,
+        task_id: int | None = None,
+        position: Position | None = None,
+    ) -> None:
+        self.events.append(
+            MissionEvent(
+                kind=kind,
+                timestamp=timestamp,
+                agent_id=agent_id,
+                task_id=task_id,
+                position=position,
+            )
+        )
+
+    def start(self, timestamp: float = 0.0) -> None:
+        if self.started:
+            raise RuntimeError("mission has already started")
+        self.started = True
+        self.metrics.start_time = timestamp
+        LOGGER.info(
+            "[MISSION] Mission started with %d agents and %d tasks",
+            len(self.agents),
+            len(self.tasks),
+        )
+        self._event(MissionEventKind.MISSION_STARTED, timestamp)
+        self.exchange_heartbeats(timestamp)
+        self.allocate_tasks(timestamp)
+        self.assert_consistent()
+
+    def exchange_heartbeats(self, timestamp: float) -> None:
+        for agent in sorted(self.agents.values(), key=lambda item: item.agent_id):
+            heartbeat = agent.send_heartbeat(timestamp)
+            if heartbeat is not None:
+                self.failure_manager.record_heartbeat(heartbeat)
+
+    def inject_failure(self, agent_id: int, timestamp: float) -> bool:
+        agent = self.agents[agent_id]
+        if not agent.inject_failure(timestamp):
+            return False
+        self.metrics.record_failure_injection(agent_id, timestamp, agent.position)
+        self._event(
+            MissionEventKind.FAILURE_INJECTED,
+            timestamp,
+            agent_id=agent_id,
+            task_id=agent.current_task,
+            position=agent.position,
+        )
+        LOGGER.info(
+            "[FAULT] Injecting failure into UAV %d at t=%.2fs", agent_id, timestamp
+        )
+        return True
+
+    def _apply_allocation(self, allocation: Allocation, timestamp: float) -> None:
+        agent = self.agents[allocation.agent_id]
+        task = self.tasks[allocation.task_id]
+        agent.assign_task(task.task_id)
+        try:
+            task.assign(agent.agent_id)
+        except Exception:
+            agent.release_task(task.task_id)
+            raise
+
+        recovery = self.metrics.recoveries.get(task.task_id)
+        if recovery is not None and recovery.reassigned_agent_id is None:
+            self.metrics.record_reassignment(task.task_id, agent.agent_id, timestamp)
+            self._event(
+                MissionEventKind.TASK_REASSIGNED,
+                timestamp,
+                agent_id=agent.agent_id,
+                task_id=task.task_id,
+            )
+            LOGGER.info(
+                "[ALLOC] Task %d reassigned -> UAV %d", task.task_id, agent.agent_id
+            )
+        else:
+            self._event(
+                MissionEventKind.TASK_ASSIGNED,
+                timestamp,
+                agent_id=agent.agent_id,
+                task_id=task.task_id,
+            )
+            LOGGER.info("[ALLOC] Task %d -> UAV %d", task.task_id, agent.agent_id)
+
+    def allocate_tasks(self, timestamp: float) -> list[Allocation]:
+        allocations = self.allocator.allocate(self.agents.values(), self.tasks.values())
+        for allocation in allocations:
+            self._apply_allocation(allocation, timestamp)
+        return allocations
+
+    def _declare_and_release(
+        self, timeout: HeartbeatTimeout, timestamp: float
+    ) -> None:
+        agent = self.agents[timeout.agent_id]
+        self.metrics.record_failure_detection(
+            agent.agent_id, timestamp, timeout.last_heartbeat
+        )
+        self._event(
+            MissionEventKind.HEARTBEAT_TIMEOUT,
+            timestamp,
+            agent_id=agent.agent_id,
+            task_id=timeout.task_id,
+        )
+        LOGGER.info(
+            "[HEARTBEAT] UAV %d heartbeat timeout at t=%.2fs",
+            agent.agent_id,
+            timestamp,
+        )
+
+        agent.declare_failed()
+        self._event(
+            MissionEventKind.FAILURE_DECLARED,
+            timestamp,
+            agent_id=agent.agent_id,
+            task_id=timeout.task_id,
+        )
+        LOGGER.info("[FAILURE] UAV %d declared FAILED", agent.agent_id)
+
+        if timeout.task_id is None:
+            return
+        task = self.tasks[timeout.task_id]
+        if task.status is TaskStatus.COMPLETED:
+            return
+        if task.status is not TaskStatus.ASSIGNED or task.assigned_agent != agent.agent_id:
+            raise RuntimeError("failed UAV/task ownership is inconsistent")
+        task.release()
+        agent.release_task(task.task_id)
+        self.metrics.record_orphan(task.task_id, agent.agent_id, timestamp)
+        self._event(
+            MissionEventKind.TASK_RELEASED,
+            timestamp,
+            agent_id=agent.agent_id,
+            task_id=task.task_id,
+        )
+        LOGGER.info(
+            "[RECOVERY] Releasing Task %d from UAV %d",
+            task.task_id,
+            agent.agent_id,
+        )
+
+    def detect_and_recover(self, timestamp: float) -> list[HeartbeatTimeout]:
+        timeouts = self.failure_manager.detect_timeouts(
+            self.agents.values(), timestamp
+        )
+        for timeout in timeouts:
+            self._declare_and_release(timeout, timestamp)
+        if timeouts:
+            self.allocate_tasks(timestamp)
+            self.assert_consistent()
+        return timeouts
+
+    def complete_task(self, agent_id: int, task_id: int, timestamp: float) -> None:
+        agent = self.agents[agent_id]
+        task = self.tasks[task_id]
+        task.complete(agent_id)
+        agent.complete_task(task_id)
+        self.metrics.record_task_completion(task_id, timestamp)
+        self._event(
+            MissionEventKind.TASK_COMPLETED,
+            timestamp,
+            agent_id=agent_id,
+            task_id=task_id,
+            position=agent.position,
+        )
+        LOGGER.info("[TASK] UAV %d completed Task %d", agent_id, task_id)
+
+    @property
+    def all_tasks_completed(self) -> bool:
+        return bool(self.tasks) and all(
+            task.status is TaskStatus.COMPLETED for task in self.tasks.values()
+        )
+
+    def finish(self, timestamp: float, completed: bool) -> None:
+        if self.finished:
+            return
+        self.finished = True
+        self.metrics.finish(timestamp, completed)
+        if completed:
+            self._event(MissionEventKind.MISSION_COMPLETED, timestamp)
+            LOGGER.info("[MISSION] Mission completed at t=%.2fs", timestamp)
+        else:
+            self._event(MissionEventKind.MISSION_TIMED_OUT, timestamp)
+            LOGGER.error("[MISSION] Mission timed out at t=%.2fs", timestamp)
+
+    def assert_consistent(self) -> None:
+        """Fail fast if bidirectional task ownership becomes inconsistent."""
+
+        active_task_ids: set[int] = set()
+        for agent in self.agents.values():
+            if agent.status is AgentStatus.FAILED and agent.current_task is not None:
+                raise RuntimeError("a failed UAV still owns a task")
+            if agent.current_task is None:
+                if agent.status is AgentStatus.ACTIVE:
+                    raise RuntimeError("an active UAV has no task")
+                continue
+            if agent.current_task in active_task_ids:
+                raise RuntimeError("multiple UAVs own the same task")
+            active_task_ids.add(agent.current_task)
+            task = self.tasks[agent.current_task]
+            if (
+                task.status is not TaskStatus.ASSIGNED
+                or task.assigned_agent != agent.agent_id
+            ):
+                raise RuntimeError("agent/task ownership links do not match")
+
+        for task in self.tasks.values():
+            if task.status is TaskStatus.UNASSIGNED and task.assigned_agent is not None:
+                raise RuntimeError("an unassigned task has an owner")
+            if task.status is TaskStatus.ASSIGNED:
+                if task.assigned_agent is None:
+                    raise RuntimeError("an assigned task has no owner")
+                owner = self.agents[task.assigned_agent]
+                if owner.current_task != task.task_id:
+                    raise RuntimeError("task/agent ownership links do not match")
