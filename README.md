@@ -152,10 +152,13 @@ policy, knowledge boundary, measured comparison, and limitations.
 | `peer_state.py` | Receiver-local last-known observations and strict freshness transitions |
 | `mission.py` | Authoritative task/agent transitions, physical recovery, events, and invariants |
 | `simulation.py` | Scenario generation, logical clock, movement, fault schedules, graph updates, and CLI |
+| `simulation_events.py` | Structured communication and peer-knowledge event types |
 | `metrics.py` | Separate physical-mission and network metrics derived from transitions |
 | `config.py` | Validated physical and communication configuration |
 | `validation.py` | Shared finite, monotonic logical-time and identifier validation |
-| `visualization.py` | Optional final matplotlib rendering, isolated from the headless core |
+| `trace.py` | Immutable playback frames, event explanations, and versioned JSON serialization |
+| `dashboard_app.py` | Local Streamlit/Plotly mission playback and debugging dashboard |
+| `visualization.py` | Legacy optional final matplotlib debugging view |
 
 Allocators only propose assignments; `Mission` applies them and checks
 bidirectional ownership. The optional 0.3A policy reads receiver-local peer
@@ -165,7 +168,8 @@ stores, but neither allocator mutates agents or tasks directly.
 
 - Python 3.11 or newer
 - `pytest`, coverage, Ruff, Pyright, and build tooling in the `dev` extra
-- `matplotlib` only for the optional visualisation
+- `matplotlib` only for the legacy static visualisation
+- Streamlit and Plotly in the optional `dashboard` extra
 
 The headless simulator has no third-party runtime dependencies. From the
 repository root, create an isolated environment and install the package with its
@@ -187,10 +191,10 @@ source .venv/bin/activate
 python -m pip install -e '.[dev]'
 ```
 
-To include the optional visualisation dependency, install both extras:
+To include both visualization interfaces and their development tooling:
 
 ```console
-python -m pip install -e ".[dev,visualization]"
+python -m pip install -e ".[dev,visualization,dashboard]"
 ```
 
 ## Run the prototypes
@@ -208,6 +212,22 @@ The installed console entry point is equivalent:
 ```console
 eudis-swarm
 ```
+
+### Trace-driven playback dashboard
+
+Record a structured trace and launch the preferred local viewer:
+
+```console
+eudis-swarm --record-trace trace.json
+eudis-swarm-dashboard trace.json
+```
+
+The dashboard provides mission and topology views, UAV and receiver-local peer
+status, allocation explanations, live metrics, playback controls, an event
+timeline, and a structured event log. See
+[`docs/visualization_layer.md`](docs/visualization_layer.md) for panel semantics
+and acceptance-scenario commands. The existing `--visualize` option remains a
+legacy final-frame matplotlib debugging view.
 
 ### Prototype 0.3A policy comparison
 
@@ -295,15 +315,17 @@ these information transitions changes physical status or task ownership.
 
 The existing `--agents`, `--tasks`, `--seed`, `--failure-agent`,
 `--failure-time`, `--failure-timeout`, `--visualize`, and `--log-level` options
-remain available. View the authoritative help with:
+remain available. `--record-trace PATH` writes dashboard playback data. View the
+authoritative help with:
 
 ```console
 python -m eudis_swarm.simulation --help
 ```
 
-`--visualize` requires the `visualization` extra. The process exits with status
-0 when the mission completes, 1 on simulated mission timeout, and 2 for a
-command-line error or unavailable requested visualization.
+`--visualize` requires the `visualization` extra and is retained as a legacy
+static debug view. The process exits with status 0 when the mission completes,
+1 on simulated mission timeout, and 2 for a command-line error or unavailable
+requested visualization.
 
 ## Preserved Prototype 0.1 recovery
 
