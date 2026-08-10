@@ -1,11 +1,15 @@
-"""Event-derived Prototype 0.1 metrics."""
+"""Event-derived physical-mission and communication-network metrics."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 from statistics import fmean
+from typing import TYPE_CHECKING, Collection
 
 from .agent import Position
+
+if TYPE_CHECKING:
+    from .communication import CommunicationGraph, CommunicationUpdate
 
 
 @dataclass(slots=True)
@@ -40,6 +44,21 @@ class SimulationMetrics:
     completed_task_ids: set[int] = field(default_factory=set)
     failures: dict[int, FailureRecord] = field(default_factory=dict)
     recoveries: dict[int, RecoveryRecord] = field(default_factory=dict)
+    initial_link_count: int | None = None
+    minimum_link_count: int | None = None
+    maximum_connected_component_count: int | None = None
+    isolation_event_count: int = 0
+    link_loss_event_count: int = 0
+    link_restoration_event_count: int = 0
+    total_communication_degraded_duration: float = 0.0
+    network_ended_connected: bool | None = None
+    healthy_unreachable_event_count: int = 0
+    _communication_initialized: bool = field(default=False, init=False, repr=False)
+    _last_communication_update: float | None = field(
+        default=None, init=False, repr=False
+    )
+    _previous_network_degraded: bool = field(default=False, init=False, repr=False)
+    _communication_finalized: bool = field(default=False, init=False, repr=False)
 
     def record_failure_injection(
         self, agent_id: int, timestamp: float, position: Position
@@ -81,7 +100,73 @@ class SimulationMetrics:
         if recovery is not None and recovery.completed_at is None:
             recovery.completed_at = timestamp
 
+    def record_communication_update(
+        self,
+        timestamp: float,
+        graph: CommunicationGraph,
+        update: CommunicationUpdate,
+        healthy_unreachable_agent_ids: Collection[int],
+    ) -> None:
+        """Record one observed topology and its transition from the prior state."""
+
+        if self._communication_finalized:
+            raise RuntimeError("communication metrics have already been finalized")
+
+        component_count = len(graph.connected_components)
+        healthy_unreachable_count = len(set(healthy_unreachable_agent_ids))
+
+        if not self._communication_initialized:
+            self.initial_link_count = graph.link_count
+            self.minimum_link_count = graph.link_count
+            self.maximum_connected_component_count = component_count
+            self.network_ended_connected = graph.is_fully_connected
+            self._communication_initialized = True
+            self._last_communication_update = timestamp
+            self._previous_network_degraded = not graph.is_fully_connected
+            return
+
+        previous_timestamp = self._last_communication_update
+        if previous_timestamp is None:
+            raise RuntimeError("communication metric lifecycle is inconsistent")
+        if timestamp < previous_timestamp:
+            raise ValueError("communication update timestamps must be non-decreasing")
+        if self._previous_network_degraded:
+            self.total_communication_degraded_duration += (
+                timestamp - previous_timestamp
+            )
+
+        if self.minimum_link_count is None:
+            self.minimum_link_count = graph.link_count
+        else:
+            self.minimum_link_count = min(self.minimum_link_count, graph.link_count)
+        if self.maximum_connected_component_count is None:
+            self.maximum_connected_component_count = component_count
+        else:
+            self.maximum_connected_component_count = max(
+                self.maximum_connected_component_count, component_count
+            )
+
+        self.link_loss_event_count += len(update.lost_links)
+        self.link_restoration_event_count += len(update.restored_links)
+        self.isolation_event_count += len(update.newly_isolated_agent_ids)
+        self.healthy_unreachable_event_count += healthy_unreachable_count
+        self.network_ended_connected = graph.is_fully_connected
+        self._last_communication_update = timestamp
+        self._previous_network_degraded = not graph.is_fully_connected
+
     def finish(self, timestamp: float, mission_completed: bool) -> None:
+        if self._communication_initialized and not self._communication_finalized:
+            previous_timestamp = self._last_communication_update
+            if previous_timestamp is None:
+                raise RuntimeError("communication metric lifecycle is inconsistent")
+            if timestamp < previous_timestamp:
+                raise ValueError("mission cannot finish before the last network update")
+            if self._previous_network_degraded:
+                self.total_communication_degraded_duration += (
+                    timestamp - previous_timestamp
+                )
+            self._last_communication_update = timestamp
+            self._communication_finalized = True
         self.end_time = timestamp
         self.mission_completed = mission_completed
 
@@ -151,22 +236,41 @@ class SimulationMetrics:
     def format_summary(self) -> str:
         """Build the concise terminal result block from recorded values."""
 
-        return "\n".join(
-            [
-                "PROTOTYPE 0.1 RESULT",
-                "",
-                f"Mission completed: {'YES' if self.mission_completed else 'NO'}",
-                f"Tasks completed: {self.completed_task_count} / {self.total_task_count}",
-                f"Agents started: {self.agents_started}",
-                f"Agents failed: {self.failed_agent_count}",
-                f"Orphaned tasks: {self.orphaned_task_count}",
-                f"Tasks reassigned: {self.reassigned_task_count}",
-                f"Recovered tasks: {self.recovered_task_count}",
-                f"Simulation duration: {self.simulation_duration:.2f} s",
-                "Failure detection latency: "
-                + self._mean_or_na(list(self.failure_detection_latencies.values())),
-                "Task reassignment latency: "
-                + self._mean_or_na(list(self.task_reassignment_latencies.values())),
-                f"Human interventions: {self.human_interventions}",
-            ]
-        )
+        lines = [
+            "PROTOTYPE 0.1 RESULT",
+            "",
+            f"Mission completed: {'YES' if self.mission_completed else 'NO'}",
+            f"Tasks completed: {self.completed_task_count} / {self.total_task_count}",
+            f"Agents started: {self.agents_started}",
+            f"Agents failed: {self.failed_agent_count}",
+            f"Orphaned tasks: {self.orphaned_task_count}",
+            f"Tasks reassigned: {self.reassigned_task_count}",
+            f"Recovered tasks: {self.recovered_task_count}",
+            f"Simulation duration: {self.simulation_duration:.2f} s",
+            "Failure detection latency: "
+            + self._mean_or_na(list(self.failure_detection_latencies.values())),
+            "Task reassignment latency: "
+            + self._mean_or_na(list(self.task_reassignment_latencies.values())),
+            f"Human interventions: {self.human_interventions}",
+        ]
+        if self._communication_initialized:
+            lines.extend(
+                [
+                    "",
+                    "NETWORK (PROTOTYPE 0.2A)",
+                    f"Initial communication links: {self.initial_link_count}",
+                    f"Minimum communication links: {self.minimum_link_count}",
+                    "Maximum connected components: "
+                    f"{self.maximum_connected_component_count}",
+                    f"Isolation events: {self.isolation_event_count}",
+                    f"Link-loss events: {self.link_loss_event_count}",
+                    f"Link-restoration events: {self.link_restoration_event_count}",
+                    "Communication-degraded duration: "
+                    f"{self.total_communication_degraded_duration:.2f} s",
+                    "Network ended connected: "
+                    f"{'YES' if self.network_ended_connected else 'NO'}",
+                    "Healthy but unreachable UAV events: "
+                    f"{self.healthy_unreachable_event_count}",
+                ]
+            )
+        return "\n".join(lines)

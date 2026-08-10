@@ -1,0 +1,361 @@
+from __future__ import annotations
+
+from types import SimpleNamespace
+
+import pytest
+
+from eudis_swarm.agent import Agent, AgentStatus
+from eudis_swarm.config import SimulationConfig
+from eudis_swarm.mission import MissionEventKind
+from eudis_swarm.simulation import (
+    CommunicationEventKind,
+    Simulation,
+    _parser,
+    main,
+)
+from eudis_swarm.task import Task, TaskStatus
+
+
+def _mission_signature(result: object) -> list[tuple[object, float, int | None, int | None]]:
+    mission = result.mission  # type: ignore[attr-defined]
+    return [
+        (event.kind, event.timestamp, event.agent_id, event.task_id)
+        for event in mission.events
+    ]
+
+
+def test_communication_outage_is_observational_and_restores_cleanly() -> None:
+    config = SimulationConfig(
+        failure_time=100.0,
+        communication_range=130.0,
+        comm_fault_agent_id=2,
+        comm_fault_start=4.0,
+        comm_fault_end=8.0,
+    )
+
+    result = Simulation(config).run()
+    metrics = result.metrics
+    agent = result.mission.agents[2]
+
+    assert metrics.mission_completed is True
+    assert metrics.completed_task_count == 20
+    assert metrics.simulation_duration == pytest.approx(11.75)
+    assert agent.responsive is True
+    assert agent.status is AgentStatus.IDLE
+    assert agent.failure_injected_at is None
+    assert agent.current_task is None
+
+    assert metrics.failed_agent_count == 0
+    assert metrics.orphaned_task_count == 0
+    assert metrics.reassigned_task_count == 0
+    assert metrics.recovered_task_count == 0
+    assert metrics.recoveries == {}
+    assert result.mission.tasks[19].status is TaskStatus.COMPLETED
+    assert result.mission.tasks[19].assigned_agent == 2
+
+    physical_recovery_kinds = {
+        MissionEventKind.HEARTBEAT_TIMEOUT,
+        MissionEventKind.FAILURE_DECLARED,
+        MissionEventKind.TASK_RELEASED,
+        MissionEventKind.TASK_REASSIGNED,
+    }
+    assert not any(
+        event.kind in physical_recovery_kinds for event in result.mission.events
+    )
+    agent_completions = [
+        (event.task_id, event.timestamp)
+        for event in result.mission.events
+        if event.kind is MissionEventKind.TASK_COMPLETED and event.agent_id == 2
+    ]
+    assert agent_completions == [
+        (19, 4.0),
+        (15, 4.75),
+        (20, 7.5),
+        (2, 11.75),
+    ]
+
+    positions_during_outage = {
+        position
+        for timestamp, position in result.position_history[2]
+        if config.comm_fault_start <= timestamp <= config.comm_fault_end
+    }
+    assert len(positions_during_outage) > 1
+
+    communication_events = result.communication_events
+    assert [
+        event.timestamp
+        for event in communication_events
+        if event.kind is CommunicationEventKind.FAULT_STARTED
+    ] == [4.0]
+    assert [
+        event.timestamp
+        for event in communication_events
+        if event.kind is CommunicationEventKind.FAULT_ENDED
+    ] == [8.0]
+    assert any(
+        event.kind is CommunicationEventKind.AGENT_UNREACHABLE
+        and event.agent_id == 2
+        and event.timestamp == 4.0
+        for event in communication_events
+    )
+    assert any(
+        event.kind is CommunicationEventKind.AGENT_REACHABLE
+        and event.agent_id == 2
+        and event.timestamp == 8.0
+        for event in communication_events
+    )
+    assert any(
+        event.kind is CommunicationEventKind.NETWORK_PARTITIONED
+        and event.timestamp == 4.0
+        for event in communication_events
+    )
+    assert any(
+        event.kind is CommunicationEventKind.NETWORK_RECONNECTED
+        and event.timestamp == 8.0
+        for event in communication_events
+    )
+
+    assert metrics.initial_link_count == 6
+    assert metrics.minimum_link_count == 3
+    assert metrics.maximum_connected_component_count == 2
+    assert metrics.isolation_event_count == 1
+    assert metrics.link_loss_event_count == 3
+    assert metrics.link_restoration_event_count == 3
+    assert metrics.total_communication_degraded_duration == pytest.approx(4.0)
+    assert metrics.network_ended_connected is True
+    assert metrics.healthy_unreachable_event_count == 1
+    assert result.communication_graph is not None
+    assert result.communication_graph.link_count == 6
+    assert result.communication_graph.is_fully_connected is True
+    assert result.communication_graph.blocked_agent_ids == frozenset()
+
+
+def test_off_grid_communication_boundaries_do_not_change_physical_events() -> None:
+    baseline = Simulation(SimulationConfig()).run()
+    with_fault = Simulation(
+        SimulationConfig(
+            comm_fault_agent_id=3,
+            comm_fault_start=1.125,
+            comm_fault_end=1.875,
+        )
+    ).run()
+
+    assert _mission_signature(with_fault) == _mission_signature(baseline)
+    assert with_fault.metrics.completed_task_ids == baseline.metrics.completed_task_ids
+    assert (
+        with_fault.metrics.failure_detection_latencies
+        == baseline.metrics.failure_detection_latencies
+    )
+    assert (
+        with_fault.metrics.task_reassignment_latencies
+        == baseline.metrics.task_reassignment_latencies
+    )
+    assert [
+        (event.kind, event.timestamp)
+        for event in with_fault.communication_events
+        if event.kind
+        in {CommunicationEventKind.FAULT_STARTED, CommunicationEventKind.FAULT_ENDED}
+    ] == [
+        (CommunicationEventKind.FAULT_STARTED, 1.125),
+        (CommunicationEventKind.FAULT_ENDED, 1.875),
+    ]
+    assert with_fault.metrics.total_communication_degraded_duration == pytest.approx(
+        0.75
+    )
+
+
+def test_graph_only_boundaries_do_not_round_physical_movement_differently() -> None:
+    speed = 0.06779116727398721
+    target = (2.557694272740827, 4.510107468035814)
+    common = dict(
+        agent_count=1,
+        task_count=1,
+        agent_speed=speed,
+        time_step=1.0,
+        completion_tolerance=5.117078104563409,
+        heartbeat_interval=1.0,
+        failure_timeout=2.5,
+        failure_agent_id=1,
+        failure_time=100.0,
+        max_simulation_time=3.0,
+        communication_range=1.0,
+    )
+
+    baseline = Simulation(
+        SimulationConfig(**common),
+        agents=[Agent(agent_id=1, position=(0.0, 0.0), speed=speed)],
+        tasks=[Task(task_id=1, position=target)],
+    ).run()
+    with_fault = Simulation(
+        SimulationConfig(
+            **common,
+            comm_fault_agent_id=1,
+            comm_fault_start=0.113,
+            comm_fault_end=0.732,
+        ),
+        agents=[Agent(agent_id=1, position=(0.0, 0.0), speed=speed)],
+        tasks=[Task(task_id=1, position=target)],
+    ).run()
+
+    assert _mission_signature(with_fault) == _mission_signature(baseline)
+    assert baseline.metrics.simulation_duration == 1.0
+    assert with_fault.metrics.simulation_duration == 1.0
+    assert baseline.mission.agents[1].position == with_fault.mission.agents[1].position
+
+
+def test_initial_isolation_is_a_baseline_not_a_transition_event() -> None:
+    config = SimulationConfig(
+        agent_count=2,
+        task_count=2,
+        agent_speed=1.0,
+        communication_range=1.0,
+        failure_agent_id=2,
+        failure_time=100.0,
+    )
+    agents = [
+        Agent(agent_id=1, position=(0.0, 0.0), speed=1.0),
+        Agent(agent_id=2, position=(100.0, 0.0), speed=1.0),
+    ]
+    tasks = [
+        Task(task_id=1, position=(0.0, 0.0)),
+        Task(task_id=2, position=(100.0, 0.0)),
+    ]
+
+    result = Simulation(config, agents=agents, tasks=tasks).run()
+
+    assert result.metrics.initial_link_count == 0
+    assert result.metrics.maximum_connected_component_count == 2
+    assert result.metrics.isolation_event_count == 0
+    assert result.metrics.healthy_unreachable_event_count == 0
+    assert result.metrics.total_communication_degraded_duration == pytest.approx(0.25)
+    assert result.metrics.network_ended_connected is False
+    assert not any(
+        event.kind is CommunicationEventKind.AGENT_UNREACHABLE
+        for event in result.communication_events
+    )
+
+
+def test_isolated_uav_keeps_a_long_running_task_through_the_outage() -> None:
+    config = SimulationConfig(
+        agent_count=3,
+        task_count=3,
+        agent_speed=1.0,
+        time_step=0.5,
+        completion_tolerance=0.0,
+        communication_range=20.0,
+        failure_agent_id=1,
+        failure_time=100.0,
+        comm_fault_agent_id=2,
+        comm_fault_start=1.0,
+        comm_fault_end=3.0,
+        max_simulation_time=20.0,
+    )
+    agents = [
+        Agent(agent_id=1, position=(0.0, 0.0), speed=1.0),
+        Agent(agent_id=2, position=(10.0, 0.0), speed=1.0),
+        Agent(agent_id=3, position=(0.0, 10.0), speed=1.0),
+    ]
+    tasks = [
+        Task(task_id=1, position=(0.0, 5.0)),
+        Task(task_id=2, position=(10.0, 5.0)),
+        Task(task_id=3, position=(0.0, 15.0)),
+    ]
+
+    result = Simulation(config, agents=agents, tasks=tasks).run()
+
+    task_events = [
+        event
+        for event in result.mission.events
+        if event.task_id == 2
+    ]
+    assert [event.kind for event in task_events] == [
+        MissionEventKind.TASK_ASSIGNED,
+        MissionEventKind.TASK_COMPLETED,
+    ]
+    assert task_events[0].agent_id == task_events[1].agent_id == 2
+    assert task_events[0].timestamp == 0.0
+    assert task_events[1].timestamp == 5.0
+    assert result.mission.tasks[2].assigned_agent == 2
+    assert result.mission.agents[2].responsive is True
+    assert result.mission.agents[2].status is AgentStatus.IDLE
+    assert result.metrics.failed_agent_count == 0
+    assert result.metrics.orphaned_task_count == 0
+    assert len(
+        {
+            position
+            for timestamp, position in result.position_history[2]
+            if config.comm_fault_start <= timestamp <= config.comm_fault_end
+        }
+    ) > 1
+
+
+def test_prototype_0_1_physical_recovery_golden_is_unchanged() -> None:
+    result = Simulation(SimulationConfig()).run()
+    failure = result.metrics.failures[2]
+    recovery = result.metrics.recoveries[19]
+
+    assert result.metrics.mission_completed is True
+    assert result.metrics.simulation_duration == 17.25
+    assert failure.injected_at == 4.0
+    assert failure.last_heartbeat == 3.0
+    assert failure.detected_at == 5.75
+    assert recovery.orphaned_at == 5.75
+    assert recovery.reassigned_agent_id == 1
+    assert recovery.reassigned_at == 10.75
+    assert recovery.completed_at == 17.25
+    assert result.mission.agents[2].status is AgentStatus.FAILED
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"communication_range": 0.0},
+        {"communication_range": float("nan")},
+        {"comm_fault_agent_id": 0},
+        {"comm_fault_agent_id": 5},
+        {"comm_fault_start": -1.0},
+        {"comm_fault_start": float("nan")},
+        {"comm_fault_end": float("inf")},
+        {"comm_fault_start": 4.0, "comm_fault_end": 4.0},
+        {"comm_fault_start": 5.0, "comm_fault_end": 4.0},
+    ],
+)
+def test_communication_configuration_is_validated(changes: dict[str, object]) -> None:
+    with pytest.raises(ValueError):
+        SimulationConfig(**changes)  # type: ignore[arg-type]
+
+
+def test_communication_cli_arguments_are_wired(monkeypatch: pytest.MonkeyPatch) -> None:
+    arguments = _parser().parse_args([])
+    assert arguments.communication_range == 130.0
+    assert arguments.comm_fault_agent is None
+    assert arguments.comm_fault_start == 4.0
+    assert arguments.comm_fault_end == 8.0
+
+    captured: dict[str, SimulationConfig] = {}
+
+    def fake_run(config: SimulationConfig) -> object:
+        captured["config"] = config
+        return SimpleNamespace(metrics=SimpleNamespace(mission_completed=True))
+
+    monkeypatch.setattr("eudis_swarm.simulation.configure_logging", lambda _level: None)
+    monkeypatch.setattr("eudis_swarm.simulation.run_simulation", fake_run)
+
+    exit_code = main(
+        [
+            "--communication-range",
+            "42",
+            "--comm-fault-agent",
+            "3",
+            "--comm-fault-start",
+            "1.25",
+            "--comm-fault-end",
+            "2.75",
+        ]
+    )
+
+    assert exit_code == 0
+    assert captured["config"].communication_range == 42.0
+    assert captured["config"].comm_fault_agent_id == 3
+    assert captured["config"].comm_fault_start == 1.25
+    assert captured["config"].comm_fault_end == 2.75
