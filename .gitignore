@@ -24,3 +24,5 @@ htmlcov/
 .DS_Store
 Thumbs.db
 *.log
+trace.json
+*.trace.json

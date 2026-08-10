@@ -7,7 +7,6 @@ import logging
 import math
 import random
 from dataclasses import dataclass
-from enum import Enum
 from typing import Mapping, Sequence
 
 from .agent import Agent, AgentStatus, Heartbeat, Position
@@ -18,49 +17,18 @@ from .messaging import DeliveryBatch, PeerStateTransport
 from .metrics import SimulationMetrics
 from .mission import Mission
 from .peer_state import PeerStateStore
+from .simulation_events import (
+    CommunicationEvent,
+    CommunicationEventKind,
+    PeerStateEvent,
+    PeerStateEventKind,
+)
 from .task import Task
 from .task_allocator import CommunicationAwareTaskAllocator, TaskAllocator
+from .trace import SimulationTrace, TraceRecorder
 from .validation import validate_timestamp
 
 LOGGER = logging.getLogger(__name__)
-
-
-class CommunicationEventKind(str, Enum):
-    """Observable communication transitions kept separate from mission events."""
-
-    NETWORK_INITIALIZED = "NETWORK_INITIALIZED"
-    FAULT_STARTED = "FAULT_STARTED"
-    FAULT_ENDED = "FAULT_ENDED"
-    LINK_LOST = "LINK_LOST"
-    LINK_RESTORED = "LINK_RESTORED"
-    NETWORK_PARTITIONED = "NETWORK_PARTITIONED"
-    NETWORK_RECONNECTED = "NETWORK_RECONNECTED"
-    AGENT_UNREACHABLE = "AGENT_UNREACHABLE"
-    AGENT_REACHABLE = "AGENT_REACHABLE"
-
-
-@dataclass(frozen=True, slots=True)
-class CommunicationEvent:
-    kind: CommunicationEventKind
-    timestamp: float
-    agent_id: int | None = None
-    peer_agent_id: int | None = None
-    component_count: int | None = None
-
-
-class PeerStateEventKind(str, Enum):
-    """Meaningful receiver-local peer-knowledge transitions."""
-
-    STALE = "STALE"
-    REFRESHED = "REFRESHED"
-
-
-@dataclass(frozen=True, slots=True)
-class PeerStateEvent:
-    kind: PeerStateEventKind
-    timestamp: float
-    observer_agent_id: int
-    peer_agent_id: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -72,6 +40,7 @@ class SimulationResult:
     communication_events: tuple[CommunicationEvent, ...] = ()
     peer_state_stores: dict[int, PeerStateStore] | None = None
     peer_state_events: tuple[PeerStateEvent, ...] = ()
+    trace: SimulationTrace | None = None
 
 
 def _initial_positions(config: SimulationConfig) -> list[Position]:
@@ -128,6 +97,7 @@ class Simulation:
         *,
         agents: Sequence[Agent] | None = None,
         tasks: Sequence[Task] | None = None,
+        capture_trace: bool = False,
     ) -> None:
         self.config = config
         scenario_agents, scenario_tasks = build_scenario(config)
@@ -194,6 +164,24 @@ class Simulation:
         self._last_communication_update: float | None = None
         self._last_communication_event: float | None = None
         self._has_run = False
+        self._trace_recorder = TraceRecorder(config) if capture_trace else None
+
+    def _capture_trace_frame(
+        self,
+        timestamp: float,
+        positions: Mapping[int, Position] | None = None,
+    ) -> None:
+        if self._trace_recorder is None:
+            return
+        self._trace_recorder.capture(
+            self.mission,
+            self.communication_graph,
+            self.peer_state_stores,
+            self.communication_events,
+            self.peer_state_events,
+            timestamp,
+            positions,
+        )
 
     def _record_positions(
         self,
@@ -560,6 +548,7 @@ class Simulation:
         self.mission.assert_consistent()
         if self.mission.all_tasks_completed:
             self.mission.finish(0.0, True)
+        self._capture_trace_frame(0.0)
 
         while (
             not self.mission.finished
@@ -643,6 +632,7 @@ class Simulation:
             if not mission_boundary:
                 self._record_positions(timestamp, communication_positions)
                 self.mission.assert_consistent()
+                self._capture_trace_frame(timestamp, communication_positions)
                 continue
 
             # Publication precedes centralized recovery and new allocation.
@@ -660,13 +650,22 @@ class Simulation:
 
             if self.mission.all_tasks_completed:
                 self.mission.finish(timestamp, True)
+                self._capture_trace_frame(timestamp)
                 break
+            self._capture_trace_frame(timestamp)
             if motion_due:
                 while next_motion <= timestamp + epsilon:
                     motion_step += 1
                     next_motion = round(motion_step * self.config.time_step, 12)
         if not self.mission.finished:
             self.mission.finish(current_time, False)
+            self._capture_trace_frame(current_time)
+
+        trace = (
+            None
+            if self._trace_recorder is None
+            else self._trace_recorder.finish(self.mission)
+        )
 
         result = SimulationResult(
             mission=self.mission,
@@ -678,13 +677,16 @@ class Simulation:
             communication_events=tuple(self.communication_events),
             peer_state_stores=dict(self.peer_state_stores),
             peer_state_events=tuple(self.peer_state_events),
+            trace=trace,
         )
         LOGGER.info("\n%s", result.metrics.format_summary())
         return result
 
 
-def run_simulation(config: SimulationConfig | None = None) -> SimulationResult:
-    return Simulation(config or SimulationConfig()).run()
+def run_simulation(
+    config: SimulationConfig | None = None, *, capture_trace: bool = False
+) -> SimulationResult:
+    return Simulation(config or SimulationConfig(), capture_trace=capture_trace).run()
 
 
 def configure_logging(level: str = "INFO") -> None:
@@ -747,6 +749,13 @@ def _parser() -> argparse.ArgumentParser:
         help="show an optional final matplotlib view",
     )
     parser.add_argument(
+        "--record-trace",
+        type=str,
+        default=None,
+        metavar="PATH",
+        help="write a structured dashboard playback trace to PATH",
+    )
+    parser.add_argument(
         "--log-level",
         choices=("DEBUG", "INFO", "WARNING", "ERROR"),
         default="INFO",
@@ -776,7 +785,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         parser.error(str(error))
 
     configure_logging(arguments.log_level)
-    result = run_simulation(config)
+    result = (
+        run_simulation(config)
+        if arguments.record_trace is None
+        else run_simulation(config, capture_trace=True)
+    )
+    if arguments.record_trace is not None:
+        if result.trace is None:
+            raise RuntimeError("trace capture was requested but no trace was produced")
+        result.trace.write_json(arguments.record_trace)
+        LOGGER.info("[TRACE] Wrote playback trace to %s", arguments.record_trace)
     if arguments.visualize:
         try:
             from .visualization import show_result

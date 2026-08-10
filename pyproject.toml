@@ -20,9 +20,14 @@ dev = [
     "ruff>=0.12,<1",
 ]
 visualization = ["matplotlib>=3.8"]
+dashboard = [
+    "plotly>=5.24,<7",
+    "streamlit>=1.40,<2",
+]
 
 [project.scripts]
 eudis-swarm = "eudis_swarm.simulation:main"
+eudis-swarm-dashboard = "eudis_swarm.dashboard:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
@@ -48,7 +53,11 @@ venv = ".venv"
 [tool.coverage.run]
 branch = true
 source = ["eudis_swarm"]
-omit = ["src/eudis_swarm/visualization.py"]
+omit = [
+    "src/eudis_swarm/dashboard.py",
+    "src/eudis_swarm/dashboard_app.py",
+    "src/eudis_swarm/visualization.py",
+]
 
 [tool.coverage.report]
 fail_under = 85
