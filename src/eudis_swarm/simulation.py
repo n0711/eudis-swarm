@@ -1,4 +1,4 @@
-"""Deterministic Prototype 0.2B simulation and command-line entry point."""
+"""Deterministic Prototype 0.3A simulation and command-line entry point."""
 
 from __future__ import annotations
 
@@ -19,7 +19,7 @@ from .metrics import SimulationMetrics
 from .mission import Mission
 from .peer_state import PeerStateStore
 from .task import Task
-from .task_allocator import TaskAllocator
+from .task_allocator import CommunicationAwareTaskAllocator, TaskAllocator
 from .validation import validate_timestamp
 
 LOGGER = logging.getLogger(__name__)
@@ -149,21 +149,11 @@ class Simulation:
         metrics = SimulationMetrics(
             total_task_count=len(selected_tasks),
             agents_started=len(selected_agents),
+            allocation_policy=config.allocation_policy,
         )
-        self.mission = Mission(
-            agents=selected_agents,
-            tasks=selected_tasks,
-            allocator=TaskAllocator(),
-            failure_manager=FailureManager(config.failure_timeout),
-            metrics=metrics,
-        )
-        self._history: dict[int, list[tuple[float, Position]]] = {
-            agent.agent_id: [(0.0, agent.position)] for agent in selected_agents
-        }
         self.communication_graph = CommunicationGraph(
             selected_agent_ids, config.communication_range
         )
-        self.communication_events: list[CommunicationEvent] = []
         self.peer_state_stores = {
             owner_agent_id: PeerStateStore(
                 owner_agent_id,
@@ -176,6 +166,25 @@ class Simulation:
             )
             for owner_agent_id in sorted(selected_agent_ids)
         }
+        allocator = (
+            TaskAllocator()
+            if config.allocation_policy == "distance"
+            else CommunicationAwareTaskAllocator(
+                self.peer_state_stores,
+                config.communication_range,
+            )
+        )
+        self.mission = Mission(
+            agents=selected_agents,
+            tasks=selected_tasks,
+            allocator=allocator,
+            failure_manager=FailureManager(config.failure_timeout),
+            metrics=metrics,
+        )
+        self._history: dict[int, list[tuple[float, Position]]] = {
+            agent.agent_id: [(0.0, agent.position)] for agent in selected_agents
+        }
+        self.communication_events: list[CommunicationEvent] = []
         self.peer_state_transport = PeerStateTransport(
             self.communication_graph, self.peer_state_stores
         )
@@ -693,7 +702,7 @@ def configure_logging(level: str = "INFO") -> None:
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Run the EUDIS resilient swarm Prototype 0.2B simulation."
+        description="Run the EUDIS resilient swarm Prototype 0.3A simulation."
     )
     parser.add_argument("--agents", type=int, default=4, help="number of UAV agents")
     parser.add_argument("--tasks", type=int, default=20, help="number of mission tasks")
@@ -710,6 +719,12 @@ def _parser() -> argparse.ArgumentParser:
         type=float,
         default=2.5,
         help="strict peer-observation freshness timeout",
+    )
+    parser.add_argument(
+        "--allocation-policy",
+        choices=("distance", "connectivity"),
+        default="distance",
+        help="task allocation policy (default: distance)",
     )
     parser.add_argument(
         "--communication-range",
@@ -760,6 +775,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             failure_time=arguments.failure_time,
             failure_timeout=arguments.failure_timeout,
             peer_state_stale_after=arguments.peer_state_stale_after,
+            allocation_policy=arguments.allocation_policy,
             communication_range=arguments.communication_range,
             comm_fault_agent_id=arguments.comm_fault_agent,
             comm_fault_start=arguments.comm_fault_start,

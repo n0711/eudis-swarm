@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "eudis-swarm"
-version = "0.2.0b0"
+version = "0.3.0a0"
 description = "Deterministic resilience and communication-topology simulation for a multi-UAV swarm"
 readme = "README.md"
 requires-python = ">=3.11"

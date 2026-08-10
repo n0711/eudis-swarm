@@ -11,7 +11,7 @@ from .agent import Agent, AgentStatus, Heartbeat, Position
 from .failure_manager import FailureManager, HeartbeatTimeout
 from .metrics import SimulationMetrics
 from .task import Task, TaskStatus
-from .task_allocator import Allocation, TaskAllocator
+from .task_allocator import Allocation, AllocationPolicy
 from .validation import validate_timestamp
 
 LOGGER = logging.getLogger(__name__)
@@ -55,7 +55,7 @@ class Mission:
         self,
         agents: Iterable[Agent],
         tasks: Iterable[Task],
-        allocator: TaskAllocator,
+        allocator: AllocationPolicy,
         failure_manager: FailureManager,
         metrics: SimulationMetrics,
     ) -> None:
@@ -172,6 +172,7 @@ class Mission:
         except Exception:
             agent.release_task(task.task_id)
             raise
+        self.metrics.record_allocation(allocation, timestamp)
 
         recovery = self.metrics.recoveries.get(task.task_id)
         if recovery is not None and recovery.reassigned_agent_id is None:
@@ -182,9 +183,12 @@ class Mission:
                 agent_id=agent.agent_id,
                 task_id=task.task_id,
             )
-            LOGGER.info(
-                "[ALLOC] Task %d reassigned -> UAV %d", task.task_id, agent.agent_id
-            )
+            if allocation.policy == "distance":
+                LOGGER.info(
+                    "[ALLOC] Task %d reassigned -> UAV %d",
+                    task.task_id,
+                    agent.agent_id,
+                )
         else:
             self._event(
                 MissionEventKind.TASK_ASSIGNED,
@@ -192,7 +196,19 @@ class Mission:
                 agent_id=agent.agent_id,
                 task_id=task.task_id,
             )
-            LOGGER.info("[ALLOC] Task %d -> UAV %d", task.task_id, agent.agent_id)
+            if allocation.policy == "distance":
+                LOGGER.info("[ALLOC] Task %d -> UAV %d", task.task_id, agent.agent_id)
+        if allocation.policy == "connectivity":
+            LOGGER.info(
+                "[ALLOC-COMM] Task %d -> UAV %d distance=%.2f predicted_links=%d%s",
+                task.task_id,
+                agent.agent_id,
+                allocation.distance,
+                allocation.predicted_peer_degree,
+                " predicted_isolation=YES"
+                if allocation.predicted_isolation
+                else " predicted_isolation=NO",
+            )
 
     def allocate_tasks(self, timestamp: float) -> list[Allocation]:
         self._require_running()

@@ -334,6 +334,7 @@ def test_communication_cli_arguments_are_wired(monkeypatch: pytest.MonkeyPatch) 
     assert arguments.comm_fault_start == 4.0
     assert arguments.comm_fault_end == 8.0
     assert arguments.peer_state_stale_after == 2.5
+    assert arguments.allocation_policy == "distance"
 
     captured: dict[str, SimulationConfig] = {}
 
@@ -356,6 +357,8 @@ def test_communication_cli_arguments_are_wired(monkeypatch: pytest.MonkeyPatch) 
             "2.75",
             "--peer-state-stale-after",
             "3.5",
+            "--allocation-policy",
+            "connectivity",
         ]
     )
 
@@ -365,3 +368,4 @@ def test_communication_cli_arguments_are_wired(monkeypatch: pytest.MonkeyPatch) 
     assert captured["config"].comm_fault_start == 1.25
     assert captured["config"].comm_fault_end == 2.75
     assert captured["config"].peer_state_stale_after == 3.5
+    assert captured["config"].allocation_policy == "connectivity"
