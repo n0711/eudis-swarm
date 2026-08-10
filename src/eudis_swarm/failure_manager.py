@@ -3,12 +3,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from math import isfinite
-from numbers import Real
 from typing import Iterable
 
 from .agent import Agent, AgentStatus, Heartbeat
-from .validation import validate_timestamp
+from .validation import validate_positive_real, validate_timestamp
 
 
 @dataclass(frozen=True, slots=True)
@@ -23,14 +21,9 @@ class FailureManager:
     """Detect silent agents without owning mission/task transitions."""
 
     def __init__(self, heartbeat_timeout: float) -> None:
-        if (
-            not isinstance(heartbeat_timeout, Real)
-            or isinstance(heartbeat_timeout, bool)
-            or not isfinite(heartbeat_timeout)
-            or heartbeat_timeout <= 0.0
-        ):
-            raise ValueError("heartbeat_timeout must be finite and greater than zero")
-        self.heartbeat_timeout = float(heartbeat_timeout)
+        self.heartbeat_timeout = validate_positive_real(
+            heartbeat_timeout, name="heartbeat_timeout"
+        )
         self._heartbeats: dict[int, Heartbeat] = {}
         self._detected_agents: set[int] = set()
         self._last_detection_time: float | None = None

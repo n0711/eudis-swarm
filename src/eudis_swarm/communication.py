@@ -16,6 +16,7 @@ from numbers import Real
 from typing import Iterable, Mapping
 
 from .agent import Position
+from .validation import validate_positive_real
 
 
 class CommunicationState(str, Enum):
@@ -41,6 +42,7 @@ class CommunicationLink:
             raise ValueError(
                 "communication link endpoints must use increasing canonical order"
             )
+        # Link records are rebuilt in the graph hot path, so keep validation local.
         if not isfinite(self.distance) or self.distance < 0.0:
             raise ValueError(
                 "communication link distance must be finite and non-negative"
@@ -101,19 +103,17 @@ class CommunicationGraph:
             raise ValueError("communication graph UAV IDs must be positive integers")
         if len(set(supplied_ids)) != len(supplied_ids):
             raise ValueError("communication graph UAV IDs must be unique")
-        if (
-            not isinstance(communication_range, Real)
-            or isinstance(communication_range, bool)
-            or not isfinite(communication_range)
-            or communication_range <= 0.0
-        ):
-            raise ValueError("communication_range must be finite and greater than zero")
-
         self._agent_ids = tuple(sorted(supplied_ids))
         self._agent_id_set = frozenset(self._agent_ids)
-        self._communication_range = float(communication_range)
+        self._communication_range = validate_positive_real(
+            communication_range, name="communication_range"
+        )
+        # UAV membership never changes, so canonical pair order is fixed once.
+        self._pair_keys = tuple(combinations(self._agent_ids, 2))
         self._blocked_agent_ids: frozenset[int] = frozenset()
         self._links: dict[tuple[int, int], CommunicationLink] = {}
+        self._active_links: tuple[CommunicationLink, ...] = ()
+        self._active_keys: frozenset[tuple[int, int]] = frozenset()
         self._neighbors: dict[int, frozenset[int]] = {}
         self._components: tuple[frozenset[int], ...] = ()
         self._isolated_agent_ids: frozenset[int] = frozenset()
@@ -140,17 +140,19 @@ class CommunicationGraph:
         """Return all canonical UAV pairs, including unavailable links."""
 
         self._require_initialized()
-        return tuple(self._links[key] for key in sorted(self._links))
+        return tuple(self._links.values())
 
     @property
     def active_links(self) -> tuple[CommunicationLink, ...]:
         """Return only currently available links in canonical order."""
 
-        return tuple(link for link in self.links if link.available)
+        self._require_initialized()
+        return self._active_links
 
     @property
     def link_count(self) -> int:
-        return len(self.active_links)
+        self._require_initialized()
+        return len(self._active_links)
 
     def link_between(
         self, left_agent_id: int, right_agent_id: int
@@ -219,7 +221,7 @@ class CommunicationGraph:
             )
 
         new_links: dict[tuple[int, int], CommunicationLink] = {}
-        for source_agent_id, destination_agent_id in combinations(self._agent_ids, 2):
+        for source_agent_id, destination_agent_id in self._pair_keys:
             source = positions[source_agent_id]
             destination = positions[destination_agent_id]
             distance = hypot(
@@ -239,7 +241,8 @@ class CommunicationGraph:
             )
             new_links[link.key] = link
 
-        new_active_keys = {key for key, link in new_links.items() if link.available}
+        new_active_links = tuple(link for link in new_links.values() if link.available)
+        new_active_keys = frozenset(link.key for link in new_active_links)
         new_neighbors, new_components = self._build_topology(new_active_keys)
         new_isolated = frozenset(
             agent_id for agent_id, peers in new_neighbors.items() if not peers
@@ -247,14 +250,11 @@ class CommunicationGraph:
         new_fully_connected = len(new_components) == 1
 
         if self._initialized:
-            previous_active_keys = {
-                key for key, link in self._links.items() if link.available
-            }
             lost_links = tuple(
-                new_links[key] for key in sorted(previous_active_keys - new_active_keys)
+                new_links[key] for key in sorted(self._active_keys - new_active_keys)
             )
             restored_links = tuple(
-                new_links[key] for key in sorted(new_active_keys - previous_active_keys)
+                new_links[key] for key in sorted(new_active_keys - self._active_keys)
             )
             newly_isolated = tuple(sorted(new_isolated - self._isolated_agent_ids))
             newly_reachable = tuple(sorted(self._isolated_agent_ids - new_isolated))
@@ -272,6 +272,8 @@ class CommunicationGraph:
 
         self._blocked_agent_ids = blocked
         self._links = new_links
+        self._active_links = new_active_links
+        self._active_keys = new_active_keys
         self._neighbors = new_neighbors
         self._components = new_components
         self._isolated_agent_ids = new_isolated
@@ -290,7 +292,7 @@ class CommunicationGraph:
         )
 
     def _build_topology(
-        self, active_keys: set[tuple[int, int]]
+        self, active_keys: set[tuple[int, int]] | frozenset[tuple[int, int]]
     ) -> tuple[dict[int, frozenset[int]], tuple[frozenset[int], ...]]:
         mutable_neighbors: dict[int, set[int]] = {
             agent_id: set() for agent_id in self._agent_ids

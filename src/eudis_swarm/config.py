@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from math import isfinite
-from numbers import Real
 
-from .validation import validate_positive_integer
+from .validation import (
+    validate_nonnegative_real,
+    validate_positive_integer,
+    validate_positive_real,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -58,13 +60,7 @@ class SimulationConfig:
             "communication_range": self.communication_range,
         }
         for name, value in positive_floats.items():
-            if (
-                not isinstance(value, Real)
-                or isinstance(value, bool)
-                or not isfinite(value)
-                or value <= 0.0
-            ):
-                raise ValueError(f"{name} must be finite and greater than zero")
+            validate_positive_real(value, name=name)
 
         non_negative_floats = {
             "completion_tolerance": self.completion_tolerance,
@@ -73,13 +69,7 @@ class SimulationConfig:
             "comm_fault_end": self.comm_fault_end,
         }
         for name, value in non_negative_floats.items():
-            if (
-                not isinstance(value, Real)
-                or isinstance(value, bool)
-                or not isfinite(value)
-                or value < 0.0
-            ):
-                raise ValueError(f"{name} must be finite and non-negative")
+            validate_nonnegative_real(value, name=name)
 
         if self.comm_fault_end <= self.comm_fault_start:
             raise ValueError("comm_fault_end must be greater than comm_fault_start")

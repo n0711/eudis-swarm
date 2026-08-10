@@ -4,12 +4,14 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
-from math import isfinite
-from numbers import Real
 from typing import Iterable
 
 from .agent import Heartbeat
-from .validation import validate_positive_integer, validate_timestamp
+from .validation import (
+    validate_positive_integer,
+    validate_positive_real,
+    validate_timestamp,
+)
 
 
 class PeerKnowledgeState(str, Enum):
@@ -52,17 +54,9 @@ class PeerStateStore:
             raise ValueError("peer_agent_ids must be unique")
         if owner_agent_id in supplied_peer_ids:
             raise ValueError("a peer-state store must not contain self-state")
-        if (
-            not isinstance(stale_after, Real)
-            or isinstance(stale_after, bool)
-            or not isfinite(stale_after)
-            or stale_after <= 0.0
-        ):
-            raise ValueError("stale_after must be finite and greater than zero")
-
         self._peer_agent_ids = tuple(sorted(supplied_peer_ids))
         self._peer_agent_id_set = frozenset(self._peer_agent_ids)
-        self._stale_after = float(stale_after)
+        self._stale_after = validate_positive_real(stale_after, name="stale_after")
         self._observations: dict[int, PeerObservation] = {}
         self._states = {
             peer_agent_id: PeerKnowledgeState.UNKNOWN
@@ -97,6 +91,16 @@ class PeerStateStore:
     def observation_for(self, peer_agent_id: int) -> PeerObservation | None:
         self._require_peer(peer_agent_id)
         return self._observations.get(peer_agent_id)
+
+    @property
+    def fresh_observations(self) -> tuple[PeerObservation, ...]:
+        """Return current reliable observations in stable peer-ID order."""
+
+        return tuple(
+            self._observations[peer_agent_id]
+            for peer_agent_id in self._peer_agent_ids
+            if self._states[peer_agent_id] is PeerKnowledgeState.FRESH
+        )
 
     def receive(self, snapshot: Heartbeat, received_at: float) -> bool:
         """Store one delivered snapshot and report refresh-after-stale."""

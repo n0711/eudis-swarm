@@ -66,6 +66,10 @@ class Mission:
         if len(self.tasks) != metrics.total_task_count:
             raise ValueError("task IDs must be unique and match metrics")
         self.allocator = allocator
+        # Agent membership is immutable; reuse one deterministic traversal order.
+        self._ordered_agents = tuple(
+            sorted(self.agents.values(), key=lambda item: item.agent_id)
+        )
         self.failure_manager = failure_manager
         self.metrics = metrics
         self.events: list[MissionEvent] = []
@@ -83,6 +87,10 @@ class Mission:
     @property
     def finished(self) -> bool:
         return self.state in {MissionState.COMPLETED, MissionState.TIMED_OUT}
+
+    @property
+    def ordered_agents(self) -> tuple[Agent, ...]:
+        return self._ordered_agents
 
     def _require_running(self) -> None:
         if self.state is not MissionState.RUNNING:
@@ -137,7 +145,7 @@ class Mission:
         self._require_running()
         timestamp = self._observe_time(timestamp)
         heartbeats: list[Heartbeat] = []
-        for agent in sorted(self.agents.values(), key=lambda item: item.agent_id):
+        for agent in self._ordered_agents:
             heartbeat = agent.send_heartbeat(timestamp)
             if heartbeat is not None:
                 self.failure_manager.record_heartbeat(heartbeat)
@@ -272,7 +280,7 @@ class Mission:
     def detect_and_recover(self, timestamp: float) -> list[HeartbeatTimeout]:
         self._require_running()
         timestamp = self._observe_time(timestamp)
-        timeouts = self.failure_manager.detect_timeouts(self.agents.values(), timestamp)
+        timeouts = self.failure_manager.detect_timeouts(self._ordered_agents, timestamp)
         for timeout in timeouts:
             self._declare_and_release(timeout, timestamp)
         if timeouts:
