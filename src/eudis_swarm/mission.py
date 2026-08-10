@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Iterable
 
-from .agent import Agent, AgentStatus, Position
+from .agent import Agent, AgentStatus, Heartbeat, Position
 from .failure_manager import FailureManager, HeartbeatTimeout
 from .metrics import SimulationMetrics
 from .task import Task, TaskStatus
@@ -116,7 +116,7 @@ class Mission:
             )
         )
 
-    def start(self, timestamp: float = 0.0) -> None:
+    def start(self, timestamp: float = 0.0) -> tuple[Heartbeat, ...]:
         if self.state is not MissionState.CREATED:
             raise RuntimeError("mission has already started")
         timestamp = self._observe_time(timestamp)
@@ -128,17 +128,21 @@ class Mission:
             len(self.tasks),
         )
         self._event(MissionEventKind.MISSION_STARTED, timestamp)
-        self.exchange_heartbeats(timestamp)
+        heartbeats = self.exchange_heartbeats(timestamp)
         self.allocate_tasks(timestamp)
         self.assert_consistent()
+        return heartbeats
 
-    def exchange_heartbeats(self, timestamp: float) -> None:
+    def exchange_heartbeats(self, timestamp: float) -> tuple[Heartbeat, ...]:
         self._require_running()
         timestamp = self._observe_time(timestamp)
+        heartbeats: list[Heartbeat] = []
         for agent in sorted(self.agents.values(), key=lambda item: item.agent_id):
             heartbeat = agent.send_heartbeat(timestamp)
             if heartbeat is not None:
                 self.failure_manager.record_heartbeat(heartbeat)
+                heartbeats.append(heartbeat)
+        return tuple(heartbeats)
 
     def inject_failure(self, agent_id: int, timestamp: float) -> bool:
         self._require_running()

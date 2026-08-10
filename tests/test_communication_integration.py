@@ -333,6 +333,7 @@ def test_communication_cli_arguments_are_wired(monkeypatch: pytest.MonkeyPatch) 
     assert arguments.comm_fault_agent is None
     assert arguments.comm_fault_start == 4.0
     assert arguments.comm_fault_end == 8.0
+    assert arguments.peer_state_stale_after == 2.5
 
     captured: dict[str, SimulationConfig] = {}
 
@@ -353,6 +354,8 @@ def test_communication_cli_arguments_are_wired(monkeypatch: pytest.MonkeyPatch) 
             "1.25",
             "--comm-fault-end",
             "2.75",
+            "--peer-state-stale-after",
+            "3.5",
         ]
     )
 
@@ -361,3 +364,4 @@ def test_communication_cli_arguments_are_wired(monkeypatch: pytest.MonkeyPatch) 
     assert captured["config"].comm_fault_agent_id == 3
     assert captured["config"].comm_fault_start == 1.25
     assert captured["config"].comm_fault_end == 2.75
+    assert captured["config"].peer_state_stale_after == 3.5

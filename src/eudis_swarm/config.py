@@ -23,6 +23,7 @@ class SimulationConfig:
     completion_tolerance: float = 0.75
     heartbeat_interval: float = 1.0
     failure_timeout: float = 2.5
+    peer_state_stale_after: float = 2.5
     failure_agent_id: int = 2
     failure_time: float = 4.0
     max_simulation_time: float = 300.0
@@ -49,6 +50,7 @@ class SimulationConfig:
             "time_step": self.time_step,
             "heartbeat_interval": self.heartbeat_interval,
             "failure_timeout": self.failure_timeout,
+            "peer_state_stale_after": self.peer_state_stale_after,
             "max_simulation_time": self.max_simulation_time,
             "communication_range": self.communication_range,
         }
