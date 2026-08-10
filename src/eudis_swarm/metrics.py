@@ -1,4 +1,4 @@
-"""Event-derived physical-mission and communication-network metrics."""
+"""Event-derived mission, network, peer-state, and allocation metrics."""
 
 from __future__ import annotations
 
@@ -11,6 +11,7 @@ from .validation import validate_timestamp
 
 if TYPE_CHECKING:
     from .communication import CommunicationGraph, CommunicationUpdate
+    from .task_allocator import Allocation
 
 
 @dataclass(slots=True)
@@ -32,6 +33,12 @@ class RecoveryRecord:
     completed_at: float | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class AllocationRecord:
+    timestamp: float
+    allocation: Allocation
+
+
 @dataclass(slots=True)
 class SimulationMetrics:
     """Metrics calculated from real state transitions in simulated time."""
@@ -42,6 +49,12 @@ class SimulationMetrics:
     end_time: float | None = None
     mission_completed: bool = False
     human_interventions: int = 0
+    allocation_policy: str = "distance"
+    connectivity_aware_assignment_count: int = 0
+    predicted_isolation_assignment_count: int = 0
+    total_predicted_peer_degree: int = 0
+    minimum_predicted_peer_degree: int | None = None
+    allocation_decisions: list[AllocationRecord] = field(default_factory=list)
     completed_task_ids: set[int] = field(default_factory=set)
     failures: dict[int, FailureRecord] = field(default_factory=dict)
     recoveries: dict[int, RecoveryRecord] = field(default_factory=dict)
@@ -132,6 +145,35 @@ class SimulationMetrics:
         recovery = self.recoveries.get(task_id)
         if recovery is not None and recovery.completed_at is None:
             recovery.completed_at = timestamp
+
+    def record_allocation(self, allocation: Allocation, timestamp: float) -> None:
+        """Record explanatory metadata for an applied allocation proposal."""
+
+        self._observe_time(timestamp)
+        if allocation.policy != "connectivity":
+            self.allocation_decisions.append(
+                AllocationRecord(timestamp=timestamp, allocation=allocation)
+            )
+            return
+        if (
+            allocation.predicted_peer_degree is None
+            or allocation.predicted_isolation is None
+        ):
+            raise ValueError("connectivity allocations require prediction metadata")
+        self.allocation_decisions.append(
+            AllocationRecord(timestamp=timestamp, allocation=allocation)
+        )
+        self.connectivity_aware_assignment_count += 1
+        self.total_predicted_peer_degree += allocation.predicted_peer_degree
+        if allocation.predicted_isolation:
+            self.predicted_isolation_assignment_count += 1
+        if self.minimum_predicted_peer_degree is None:
+            self.minimum_predicted_peer_degree = allocation.predicted_peer_degree
+        else:
+            self.minimum_predicted_peer_degree = min(
+                self.minimum_predicted_peer_degree,
+                allocation.predicted_peer_degree,
+            )
 
     def record_communication_update(
         self,
@@ -301,6 +343,14 @@ class SimulationMetrics:
             if recovery.reassigned_at is not None
         }
 
+    @property
+    def mean_predicted_peer_degree(self) -> float | None:
+        if self.connectivity_aware_assignment_count == 0:
+            return None
+        return (
+            self.total_predicted_peer_degree / self.connectivity_aware_assignment_count
+        )
+
     @staticmethod
     def _mean_or_na(values: list[float]) -> str:
         return "N/A" if not values else f"{fmean(values):.2f} s"
@@ -356,6 +406,26 @@ class SimulationMetrics:
                 f"Peer refresh transitions: {self.peer_state_refresh_transition_count}",
                 "Maximum simultaneous stale observations: "
                 f"{self.maximum_simultaneous_stale_peer_observations}",
+            ]
+        )
+        mean_degree = self.mean_predicted_peer_degree
+        lines.extend(
+            [
+                "",
+                "ALLOCATION (PROTOTYPE 0.3A)",
+                f"Allocation policy: {self.allocation_policy}",
+                "Connectivity-aware assignments: "
+                f"{self.connectivity_aware_assignment_count}",
+                "Assignments predicting isolation: "
+                f"{self.predicted_isolation_assignment_count}",
+                "Mean predicted peer degree: "
+                + ("N/A" if mean_degree is None else f"{mean_degree:.2f}"),
+                "Minimum predicted peer degree: "
+                + (
+                    "N/A"
+                    if self.minimum_predicted_peer_degree is None
+                    else str(self.minimum_predicted_peer_degree)
+                ),
             ]
         )
         return "\n".join(lines)

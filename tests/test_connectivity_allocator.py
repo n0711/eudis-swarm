@@ -1,0 +1,148 @@
+from __future__ import annotations
+
+from eudis_swarm.agent import Agent
+from eudis_swarm.peer_state import PeerKnowledgeState, PeerStateStore
+from eudis_swarm.task import Task
+from eudis_swarm.task_allocator import (
+    CommunicationAwareTaskAllocator,
+    TaskAllocator,
+)
+
+
+def _store(owner_id: int, peer_ids: tuple[int, ...]) -> PeerStateStore:
+    return PeerStateStore(owner_id, peer_ids, stale_after=2.5)
+
+
+def test_unknown_knowledge_falls_back_to_distance_ordering() -> None:
+    agents = [
+        Agent(agent_id=2, position=(10.0, 0.0), speed=1.0),
+        Agent(agent_id=1, position=(0.0, 0.0), speed=1.0),
+    ]
+    tasks = [
+        Task(task_id=2, position=(9.0, 0.0)),
+        Task(task_id=1, position=(1.0, 0.0)),
+    ]
+    stores = {1: _store(1, (2,)), 2: _store(2, (1,))}
+
+    baseline = TaskAllocator().allocate(agents, tasks)
+    connectivity = CommunicationAwareTaskAllocator(stores, 3.0).allocate(agents, tasks)
+
+    assert [(item.agent_id, item.task_id) for item in connectivity] == [
+        (item.agent_id, item.task_id) for item in baseline
+    ]
+    assert all(item.predicted_peer_degree == 0 for item in connectivity)
+    assert all(item.predicted_isolation is True for item in connectivity)
+
+
+def test_fresh_peer_connectivity_changes_the_distance_only_choice() -> None:
+    observer = Agent(agent_id=1, position=(0.0, 0.0), speed=1.0)
+    peer = Agent(agent_id=2, position=(10.0, 0.0), speed=1.0)
+    snapshot = peer.send_heartbeat(0.0)
+    assert snapshot is not None
+    store = _store(1, (2,))
+    store.receive(snapshot, 0.0)
+    near = Task(task_id=1, position=(1.0, 0.0))
+    linked = Task(task_id=2, position=(7.0, 0.0))
+
+    baseline = TaskAllocator().allocate((observer,), (near, linked))[0]
+    allocator = CommunicationAwareTaskAllocator({1: store}, 3.0)
+    near_evaluation = allocator.evaluate_candidate(observer, near)
+    linked_evaluation = allocator.evaluate_candidate(observer, linked)
+    connectivity = allocator.allocate((observer,), (near, linked))[0]
+
+    assert (baseline.task_id, baseline.distance) == (1, 1.0)
+    assert baseline.predicted_peer_degree is None
+    assert near_evaluation.predicted_peer_degree == 0
+    assert near_evaluation.predicted_isolation is True
+    assert linked_evaluation.predicted_peer_degree == 1
+    assert linked_evaluation.predicted_isolation is False
+    assert connectivity.task_id == 2
+    assert connectivity.distance == 7.0
+    assert connectivity.predicted_peer_degree == 1
+    assert connectivity.predicted_isolation is False
+
+
+def test_stale_peer_is_excluded_and_does_not_make_agent_unavailable() -> None:
+    observer = Agent(agent_id=1, position=(0.0, 0.0), speed=1.0)
+    peer = Agent(agent_id=2, position=(10.0, 0.0), speed=1.0)
+    snapshot = peer.send_heartbeat(0.0)
+    assert snapshot is not None
+    store = _store(1, (2,))
+    store.receive(snapshot, 0.0)
+    assert store.advance_time(2.5001) == (2,)
+    assert store.state_for(2) is PeerKnowledgeState.STALE
+
+    allocation = CommunicationAwareTaskAllocator({1: store}, 3.0).allocate(
+        (observer,),
+        (Task(task_id=1, position=(1.0, 0.0)), Task(task_id=2, position=(7.0, 0.0))),
+    )[0]
+
+    assert observer.available is True
+    assert allocation.task_id == 1
+    assert allocation.predicted_peer_degree == 0
+    assert allocation.predicted_isolation is True
+
+
+def test_prediction_uses_last_delivery_until_refreshed() -> None:
+    observer = Agent(agent_id=1, position=(0.0, 0.0), speed=1.0)
+    peer = Agent(agent_id=2, position=(10.0, 0.0), speed=20.0)
+    snapshot = peer.send_heartbeat(0.0)
+    assert snapshot is not None
+    store = _store(1, (2,))
+    store.receive(snapshot, 0.0)
+
+    peer.assign_task(99)
+    peer.move_toward((-10.0, 0.0), 1.0)
+    assert peer.position == (-10.0, 0.0)
+    tasks = (
+        Task(task_id=1, position=(7.0, 0.0)),
+        Task(task_id=2, position=(-7.0, 0.0)),
+    )
+
+    first_choice = CommunicationAwareTaskAllocator(
+        {1: store, 2: _store(2, (1,))}, 3.0
+    ).allocate((observer, peer), tasks)[0]
+
+    assert first_choice.agent_id == 1
+    assert first_choice.task_id == 1
+    assert first_choice.predicted_peer_degree == 1
+
+    refreshed_snapshot = peer.send_heartbeat(1.0)
+    assert refreshed_snapshot is not None
+    store.receive(refreshed_snapshot, 1.0)
+    second_choice = CommunicationAwareTaskAllocator({1: store}, 3.0).allocate(
+        (observer,), tasks
+    )[0]
+
+    assert second_choice.task_id == 2
+    assert second_choice.predicted_peer_degree == 1
+
+
+def test_connectivity_ties_resolve_by_agent_then_task_id() -> None:
+    agents = (
+        Agent(agent_id=2, position=(0.0, 0.0), speed=1.0),
+        Agent(agent_id=1, position=(0.0, 0.0), speed=1.0),
+    )
+    stores = {1: _store(1, (2,)), 2: _store(2, (1,))}
+    tasks = (
+        Task(task_id=2, position=(1.0, 0.0)),
+        Task(task_id=1, position=(1.0, 0.0)),
+    )
+
+    allocations = CommunicationAwareTaskAllocator(stores, 3.0).allocate(agents, tasks)
+
+    assert [(item.agent_id, item.task_id) for item in allocations] == [(1, 1), (2, 2)]
+
+
+def test_connectivity_allocator_excludes_failed_agents() -> None:
+    healthy = Agent(agent_id=1, position=(0.0, 0.0), speed=1.0)
+    failed = Agent(agent_id=2, position=(10.0, 0.0), speed=1.0)
+    failed.declare_failed()
+    stores = {1: _store(1, (2,)), 2: _store(2, (1,))}
+
+    allocation = CommunicationAwareTaskAllocator(stores, 3.0).allocate(
+        (healthy, failed), (Task(task_id=1, position=(10.0, 0.0)),)
+    )[0]
+
+    assert allocation.agent_id == 1
+    assert failed.current_task is None

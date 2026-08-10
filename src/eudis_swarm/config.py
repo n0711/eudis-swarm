@@ -1,4 +1,4 @@
-"""Central configuration for the Prototype 0.2A simulation."""
+"""Central configuration for the deterministic swarm simulation."""
 
 from __future__ import annotations
 
@@ -24,6 +24,7 @@ class SimulationConfig:
     heartbeat_interval: float = 1.0
     failure_timeout: float = 2.5
     peer_state_stale_after: float = 2.5
+    allocation_policy: str = "distance"
     failure_agent_id: int = 2
     failure_time: float = 4.0
     max_simulation_time: float = 300.0
@@ -42,6 +43,8 @@ class SimulationConfig:
             validate_positive_integer(
                 self.comm_fault_agent_id, name="comm_fault_agent_id"
             )
+        if self.allocation_policy not in {"distance", "connectivity"}:
+            raise ValueError("allocation_policy must be 'distance' or 'connectivity'")
 
         positive_floats = {
             "area_width": self.area_width,

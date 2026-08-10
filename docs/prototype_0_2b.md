@@ -148,9 +148,11 @@ python -m build
 
 ## Deliberately deferred
 
-Prototype 0.2B does not implement communications-aware allocation or task release,
-connectivity-aware path planning, relay roles, consensus, leader election,
+Within its historical scope, Prototype 0.2B does not implement
+communications-aware allocation or task release, connectivity-aware path
+planning, relay roles, consensus, leader election,
 multi-hop routing, forwarding, flooding, retransmission, message queues, latency,
 jitter, bandwidth, stochastic loss, RF propagation, ROS 2, DDS, MAVLink,
 autopilots, SITL, Gazebo, or quantum optimization. Those belong to later,
-separately scoped prototypes.
+separately scoped prototypes. Prototype 0.3A subsequently adds only the optional
+new-task allocation policy documented in [its own design](prototype_0_3a.md).

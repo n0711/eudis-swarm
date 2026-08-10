@@ -14,11 +14,14 @@ contains incremental, deterministic simulation prototypes:
   invariant testing, and automated quality checks without adding swarm behavior.
 - **Prototype 0.2B** uses active one-hop graph links to deliver immutable state
   snapshots into receiver-local `UNKNOWN` / `FRESH` / `STALE` peer views.
+- **Prototype 0.3A** adds an optional connectivity-aware greedy allocator that
+  evaluates task endpoints using each candidate UAV's `FRESH` peer snapshots.
 
 > **Simulation only:** these prototypes are algorithmic, two-dimensional
 > point-mass simulations. The distance threshold and instantaneous one-hop state
-> delivery are abstract models, not RF or network-protocol results. Nothing models real flight
-> dynamics, radios, network transport, autopilots, sensors, collision avoidance,
+> delivery are abstract models, not RF or network-protocol results. Nothing
+> models real flight dynamics, radios, network transport, autopilots, sensors,
+> collision avoidance,
 > or safety-critical operation, and it must not be interpreted as flight-ready
 > software.
 
@@ -115,13 +118,34 @@ a transitional centralized mission mechanism and does not consume peer stores.
 See [the Prototype 0.2B technical design](docs/prototype_0_2b.md) for the transport
 contract, deterministic outage trace, tests, metrics, and deferred work.
 
+## What Prototype 0.3A adds
+
+The nearest-distance `TaskAllocator` remains the default experimental baseline.
+Selecting `--allocation-policy connectivity` uses a second greedy policy. For
+each candidate UAV/task pair it predicts direct endpoint connectivity from that
+UAV's own `FRESH` peer observations and minimizes:
+
+```text
+(predicted_isolation, -predicted_peer_degree, distance, agent_id, task_id)
+```
+
+`STALE` and `UNKNOWN` peers contribute no predicted links. The allocator never
+reads another UAV's authoritative current position for this prediction. If all
+peer knowledge is initially unknown, every predicted degree is zero and the
+score naturally falls back to the existing distance and ID ordering.
+
+The policy affects only new task proposals. `Mission` remains the centralized
+authoritative owner of assignment, and active work is never preempted. See
+[the Prototype 0.3A technical design](docs/prototype_0_3a.md) for the exact
+policy, knowledge boundary, measured comparison, and limitations.
+
 ## Architecture
 
 | Module | Responsibility |
 | --- | --- |
 | `agent.py` | Physical UAV state, constant-speed 2D movement, and direct heartbeat generation |
 | `task.py` | Task ownership and `UNASSIGNED` / `ASSIGNED` / `COMPLETED` states |
-| `task_allocator.py` | Replaceable greedy nearest-pair allocation policy |
+| `task_allocator.py` | Distance baseline, minimal policy protocol, and local-knowledge connectivity allocator |
 | `failure_manager.py` | Latest-heartbeat storage and strict physical-failure timeout detection |
 | `communication.py` | Abstract links, communication state, dynamic graph topology, and graph transitions |
 | `messaging.py` | Instantaneous one-hop delivery of immutable snapshots across active direct links |
@@ -133,10 +157,9 @@ contract, deterministic outage trace, tests, metrics, and deferred work.
 | `validation.py` | Shared finite, monotonic logical-time and identifier validation |
 | `visualization.py` | Optional final matplotlib rendering, isolated from the headless core |
 
-The allocator still proposes assignments using only task distance and physical
-availability. `Mission` applies them and checks bidirectional ownership. The
-communication and peer-state layers neither mutate agents/tasks nor participate
-in mission decisions in Prototype 0.2B.
+Allocators only propose assignments; `Mission` applies them and checks
+bidirectional ownership. The optional 0.3A policy reads receiver-local peer
+stores, but neither allocator mutates agents or tasks directly.
 
 ## Requirements and installation
 
@@ -185,6 +208,36 @@ The installed console entry point is equivalent:
 ```console
 eudis-swarm
 ```
+
+### Prototype 0.3A policy comparison
+
+These commands use identical mission inputs and differ only by allocation
+policy:
+
+```console
+python -m eudis_swarm.simulation --seed 1 --failure-time 100 --communication-range 35 --allocation-policy distance
+python -m eudis_swarm.simulation --seed 1 --failure-time 100 --communication-range 35 --allocation-policy connectivity
+```
+
+Both policies make the same first 11 assignments. At `t=4.50 s`, the distance
+baseline selects UAV 2 -> Task 2 at `11.18` distance units. UAV 2's local peer
+store predicts zero reliable links there. The connectivity policy instead
+selects UAV 2 -> Task 3 at `24.20` units because its `FRESH` snapshots predict
+one direct peer link.
+
+| Result | Distance | Connectivity |
+| --- | ---: | ---: |
+| Tasks completed | `20 / 20` | `20 / 20` |
+| Mission duration | `12.00 s` | `17.25 s` |
+| Isolation events | `4` | `1` |
+| Minimum links | `0` | `0` |
+| Maximum components | `4` | `4` |
+| Degraded duration | `8.25 s` | `8.25 s` |
+| Link losses/restorations | `4 / 5` | `5 / 8` |
+
+This is a measured tradeoff: fewer isolation transitions and more travel/mission
+time. It does not establish global optimality, and several network metrics are
+unchanged or mixed.
 
 ### Prototype 0.2A communications demonstration
 
@@ -238,6 +291,7 @@ these information transitions changes physical status or task ownership.
 | `--comm-fault-start` | `4.0` | Logical time at which blocking starts |
 | `--comm-fault-end` | `8.0` | Logical time at which blocking ends; must be later than the start |
 | `--peer-state-stale-after` | `2.5` | Strict receiver-local snapshot freshness threshold |
+| `--allocation-policy` | `distance` | `distance` baseline or `connectivity` local-knowledge policy |
 
 The existing `--agents`, `--tasks`, `--seed`, `--failure-agent`,
 `--failure-time`, `--failure-timeout`, `--visualize`, and `--log-level` options
@@ -308,7 +362,11 @@ Coverage includes the preserved allocation and fail-stop recovery tests plus:
 - proof that communication loss does not release tasks or trigger physical
   failure recovery; and
 - exact regression of the original `4.00 -> 5.75 -> 10.75 -> 17.25` physical
-  recovery sequence.
+  recovery sequence;
+- proof that only fresh delivered peer positions affect connectivity scores;
+- proof that authoritative peer movement is invisible until a new snapshot is
+  delivered; and
+- deterministic baseline-versus-connectivity decision and outcome comparison.
 
 ### Six-agent smoke scenario
 
@@ -345,6 +403,11 @@ attempts, successful and link-gated undelivered messages, stale and refresh
 transitions, and the maximum number of simultaneous stale receiver-local
 observations. It does not feed mission decisions.
 
+The `ALLOCATION (PROTOTYPE 0.3A)` block reports the selected policy,
+connectivity-aware assignment count, assignments predicting isolation, and mean
+and minimum predicted fresh-peer degree. Applied decision records retain the
+timestamp, selected IDs, distance, policy, degree, and isolation prediction.
+
 ## Current limitations
 
 - The link model is only an inclusive Euclidean distance threshold plus an
@@ -353,8 +416,9 @@ observations. It does not feed mission decisions.
 - Peer snapshots use instantaneous one-hop in-process delivery. There are no
   queues, retries, forwarding, multi-hop routing, latency, jitter, bandwidth, or
   stochastic packet loss.
-- Peer knowledge is informational only. Allocation, path planning, movement,
-  task ownership, and physical failure recovery do not consume it.
+- Peer knowledge affects only new allocations when the connectivity policy is
+  explicitly selected. It does not affect path planning, movement, existing
+  task ownership, or physical failure recovery.
 - Physical fail-stop recovery still uses the transitional centralized heartbeat
   manager; only the new receiver-local peer knowledge is graph-mediated.
 - The graph is centralized, recomputed from authoritative positions, and has no
@@ -364,8 +428,8 @@ observations. It does not feed mission decisions.
   consensus or peer-to-peer protocol.
 - Agents remain point masses without aircraft dynamics, vehicle constraints,
   terrain, collision avoidance, or energy limits.
-- Tasks remain independent points and allocation remains greedy Euclidean
-  distance rather than global route optimization.
+- Tasks remain independent points. Both policies are centralized greedy pairing,
+  not joint trajectory prediction or global optimization.
 - Physical failure injection still models one fail-stop UAV; there is no
   rejoin, intermittent, Byzantine, or simultaneous-failure model.
 - The optional visualization is a final debugging view, not a live dashboard or
@@ -381,8 +445,10 @@ observations. It does not feed mission decisions.
   abstract link degradation, partition, isolation, restoration, and metrics.
 - **Prototype 0.2B — implemented:** active direct links mediate immutable peer
   state delivery and receiver-local freshness, without adaptive behavior.
-- **Prototype 0.3 — planned:** communications-aware task allocation and path
-  planning experiments.
+- **Prototype 0.3A — implemented:** optional connectivity-aware allocation from
+  receiver-local fresh peer snapshots.
+- **Later Prototype 0.3 milestones — planned:** communications-aware path
+  planning, relay, and distributed allocation experiments.
 - **Prototype 0.4 — planned:** QUBO / quantum-simulated optimization experiments.
 - **Prototype 0.5 — planned:** distributed ROS 2 implementation.
 - **Prototype 0.6 — planned:** ArduPilot multi-UAV SITL integration.

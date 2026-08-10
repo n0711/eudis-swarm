@@ -88,6 +88,11 @@ def test_invalid_configuration_values_are_rejected(field: str, value: object) ->
         SimulationConfig(**{field: value})  # type: ignore[arg-type]
 
 
+def test_invalid_allocation_policy_is_rejected() -> None:
+    with pytest.raises(ValueError, match="allocation_policy"):
+        SimulationConfig(allocation_policy="unknown")
+
+
 def test_lifecycle_rejects_operations_outside_running_state() -> None:
     mission = _mission()
 
