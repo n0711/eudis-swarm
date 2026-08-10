@@ -23,7 +23,7 @@ jobs:
       - name: Create virtual environment
         run: python -m venv .venv
       - name: Install package and development tools
-        run: .venv/bin/python -m pip install -e ".[dev]"
+        run: .venv/bin/python -m pip install -e ".[dev,visualization]"
       - name: Ruff lint
         run: .venv/bin/python -m ruff check .
       - name: Ruff format check
