@@ -47,6 +47,7 @@ class PeerStateTransport:
                 raise ValueError("each peer-state store must contain every other UAV")
         self._graph = graph
         self._stores = dict(stores)
+        self._agent_ids = frozenset(graph.agent_ids)
         self._last_timestamp: float | None = None
 
     def deliver(
@@ -67,7 +68,7 @@ class PeerStateTransport:
         source_ids = tuple(snapshot.agent_id for snapshot in ordered_snapshots)
         if len(set(source_ids)) != len(source_ids):
             raise ValueError("a delivery batch may contain one snapshot per source")
-        unknown_sources = set(source_ids) - set(self._graph.agent_ids)
+        unknown_sources = set(source_ids) - self._agent_ids
         if unknown_sources:
             raise ValueError(f"unknown snapshot source UAVs: {sorted(unknown_sources)}")
         if any(snapshot.timestamp > timestamp for snapshot in ordered_snapshots):
@@ -77,12 +78,13 @@ class PeerStateTransport:
         delivered = 0
         refreshed: list[tuple[int, int]] = []
         for snapshot in ordered_snapshots:
+            # One neighbor lookup replaces a validated graph lookup per receiver.
+            active_receivers = self._graph.neighbors(snapshot.agent_id)
             for receiver_agent_id in self._graph.agent_ids:
                 if receiver_agent_id == snapshot.agent_id:
                     continue
                 attempted += 1
-                link = self._graph.link_between(snapshot.agent_id, receiver_agent_id)
-                if not link.available:
+                if receiver_agent_id not in active_receivers:
                     continue
                 delivered += 1
                 if self._stores[receiver_agent_id].receive(snapshot, timestamp):

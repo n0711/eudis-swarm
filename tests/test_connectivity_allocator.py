@@ -4,6 +4,7 @@ from eudis_swarm.agent import Agent
 from eudis_swarm.peer_state import PeerKnowledgeState, PeerStateStore
 from eudis_swarm.task import Task
 from eudis_swarm.task_allocator import (
+    Allocation,
     CommunicationAwareTaskAllocator,
     TaskAllocator,
 )
@@ -146,3 +147,61 @@ def test_connectivity_allocator_excludes_failed_agents() -> None:
 
     assert allocation.agent_id == 1
     assert failed.current_task is None
+
+
+def test_ranked_batch_matches_repeated_minimum_semantics() -> None:
+    agents = (
+        Agent(agent_id=1, position=(0.0, 0.0), speed=1.0),
+        Agent(agent_id=2, position=(10.0, 0.0), speed=1.0),
+        Agent(agent_id=3, position=(5.0, 8.0), speed=1.0),
+    )
+    stores = {
+        agent.agent_id: _store(
+            agent.agent_id,
+            tuple(peer.agent_id for peer in agents if peer.agent_id != agent.agent_id),
+        )
+        for agent in agents
+    }
+    snapshots = {agent.agent_id: agent.send_heartbeat(0.0) for agent in agents}
+    assert all(snapshot is not None for snapshot in snapshots.values())
+    for owner_id, store in stores.items():
+        for peer_id, snapshot in snapshots.items():
+            if peer_id != owner_id:
+                assert snapshot is not None
+                store.receive(snapshot, 0.0)
+
+    tasks = (
+        Task(task_id=1, position=(2.0, 1.0)),
+        Task(task_id=2, position=(8.0, 1.0)),
+        Task(task_id=3, position=(5.0, 6.0)),
+        Task(task_id=4, position=(20.0, 20.0)),
+    )
+    allocator = CommunicationAwareTaskAllocator(stores, 6.0)
+    remaining_agents = {agent.agent_id: agent for agent in agents}
+    remaining_tasks = {task.task_id: task for task in tasks}
+    repeated_minimum = []
+    while remaining_agents and remaining_tasks:
+        evaluations = (
+            allocator.evaluate_candidate(agent, task)
+            for agent in remaining_agents.values()
+            for task in remaining_tasks.values()
+        )
+
+        def score(item: Allocation) -> tuple[int, int, float, int, int]:
+            degree = item.predicted_peer_degree
+            isolation = item.predicted_isolation
+            assert degree is not None and isolation is not None
+            return (
+                int(isolation),
+                -degree,
+                item.distance,
+                item.agent_id,
+                item.task_id,
+            )
+
+        selected = min(evaluations, key=score)
+        repeated_minimum.append(selected)
+        del remaining_agents[selected.agent_id]
+        del remaining_tasks[selected.task_id]
+
+    assert allocator.allocate(agents, tasks) == repeated_minimum

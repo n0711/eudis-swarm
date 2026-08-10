@@ -3,14 +3,29 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from math import hypot, isfinite
-from numbers import Real
+from math import hypot
 from typing import Iterable, Mapping, Protocol
 
-from .agent import Agent
-from .peer_state import PeerKnowledgeState, PeerStateStore
+from .agent import Agent, Position
+from .peer_state import PeerStateStore
 from .task import Task, TaskStatus
-from .validation import validate_positive_integer
+from .validation import (
+    validate_nonnegative_real,
+    validate_positive_integer,
+    validate_positive_real,
+)
+
+
+def _available_agents(agents: Iterable[Agent]) -> dict[int, Agent]:
+    return {agent.agent_id: agent for agent in agents if agent.available}
+
+
+def _unassigned_tasks(tasks: Iterable[Task]) -> dict[int, Task]:
+    return {
+        task.task_id: task
+        for task in tasks
+        if task.status is TaskStatus.UNASSIGNED and task.assigned_agent is None
+    }
 
 
 @dataclass(frozen=True, slots=True)
@@ -25,13 +40,7 @@ class Allocation:
     def __post_init__(self) -> None:
         validate_positive_integer(self.agent_id, name="allocation agent_id")
         validate_positive_integer(self.task_id, name="allocation task_id")
-        if (
-            not isinstance(self.distance, Real)
-            or isinstance(self.distance, bool)
-            or not isfinite(self.distance)
-            or self.distance < 0.0
-        ):
-            raise ValueError("allocation distance must be finite and non-negative")
+        validate_nonnegative_real(self.distance, name="allocation distance")
         if self.policy not in {"distance", "connectivity"}:
             raise ValueError("unknown allocation policy")
         if self.policy == "distance":
@@ -68,33 +77,33 @@ class TaskAllocator:
     ) -> list[Allocation]:
         """Propose unique assignments without mutating mission state."""
 
-        candidates_agents = {
-            agent.agent_id: agent
-            for agent in sorted(agents, key=lambda item: item.agent_id)
-            if agent.available
-        }
-        candidates_tasks = {
-            task.task_id: task
-            for task in sorted(tasks, key=lambda item: item.task_id)
-            if task.status is TaskStatus.UNASSIGNED and task.assigned_agent is None
-        }
+        candidate_agents = _available_agents(agents)
+        candidate_tasks = _unassigned_tasks(tasks)
         allocations: list[Allocation] = []
 
-        while candidates_agents and candidates_tasks:
-            distance, agent_id, task_id = min(
+        ranked_pairs = sorted(
+            (
                 (
                     agent.distance_to(task.position),
                     agent.agent_id,
                     task.task_id,
                 )
-                for agent in candidates_agents.values()
-                for task in candidates_tasks.values()
+                for agent in candidate_agents.values()
+                for task in candidate_tasks.values()
             )
+        )
+        remaining_agent_ids = set(candidate_agents)
+        remaining_task_ids = set(candidate_tasks)
+        for distance, agent_id, task_id in ranked_pairs:
+            if agent_id not in remaining_agent_ids or task_id not in remaining_task_ids:
+                continue
             allocations.append(
                 Allocation(agent_id=agent_id, task_id=task_id, distance=distance)
             )
-            del candidates_agents[agent_id]
-            del candidates_tasks[task_id]
+            remaining_agent_ids.remove(agent_id)
+            remaining_task_ids.remove(task_id)
+            if not remaining_agent_ids or not remaining_task_ids:
+                break
 
         return allocations
 
@@ -107,40 +116,40 @@ class CommunicationAwareTaskAllocator:
         peer_state_stores: Mapping[int, PeerStateStore],
         communication_range: float,
     ) -> None:
-        if (
-            not isinstance(communication_range, Real)
-            or isinstance(communication_range, bool)
-            or not isfinite(communication_range)
-            or communication_range <= 0.0
-        ):
-            raise ValueError("communication_range must be finite and greater than zero")
+        communication_range = validate_positive_real(
+            communication_range, name="communication_range"
+        )
         for owner_agent_id, store in peer_state_stores.items():
             if owner_agent_id != store.owner_agent_id:
                 raise ValueError("peer-state store key must match its owner")
         self._peer_state_stores = dict(peer_state_stores)
-        self._communication_range = float(communication_range)
+        self._communication_range = communication_range
 
-    def _predicted_degree(self, agent_id: int, task: Task) -> int:
+    def _fresh_peer_positions(self, agent_id: int) -> tuple[Position, ...]:
         try:
             store = self._peer_state_stores[agent_id]
         except KeyError as error:
             raise ValueError(f"missing peer-state store for UAV {agent_id}") from error
+        return tuple(
+            observation.snapshot.position for observation in store.fresh_observations
+        )
 
+    def _predicted_degree_from_positions(
+        self,
+        task: Task,
+        fresh_peer_positions: tuple[Position, ...],
+    ) -> int:
+        task_x, task_y = task.position
         predicted_degree = 0
-        for peer_agent_id in store.peer_agent_ids:
-            if store.state_for(peer_agent_id) is not PeerKnowledgeState.FRESH:
-                continue
-            observation = store.observation_for(peer_agent_id)
-            if observation is None:
-                raise RuntimeError("fresh peer state must contain an observation")
-            peer_position = observation.snapshot.position
-            distance = hypot(
-                task.position[0] - peer_position[0],
-                task.position[1] - peer_position[1],
-            )
-            if distance <= self._communication_range:
+        for peer_x, peer_y in fresh_peer_positions:
+            if hypot(task_x - peer_x, task_y - peer_y) <= self._communication_range:
                 predicted_degree += 1
         return predicted_degree
+
+    def _predicted_degree(self, agent_id: int, task: Task) -> int:
+        return self._predicted_degree_from_positions(
+            task, self._fresh_peer_positions(agent_id)
+        )
 
     def evaluate_candidate(self, agent: Agent, task: Task) -> Allocation:
         """Explain one candidate using only the UAV's local peer observations."""
@@ -155,50 +164,58 @@ class CommunicationAwareTaskAllocator:
             predicted_isolation=predicted_degree == 0,
         )
 
-    @staticmethod
-    def _score(allocation: Allocation) -> tuple[int, int, float, int, int]:
-        degree = allocation.predicted_peer_degree
-        isolation = allocation.predicted_isolation
-        if degree is None or isolation is None:
-            raise ValueError("connectivity candidate is missing prediction metadata")
-        return (
-            int(isolation),
-            -degree,
-            allocation.distance,
-            allocation.agent_id,
-            allocation.task_id,
-        )
-
     def allocate(
         self, agents: Iterable[Agent], tasks: Iterable[Task]
     ) -> list[Allocation]:
         """Propose unique pairs using local-knowledge connectivity first."""
 
-        candidate_agents = {
-            agent.agent_id: agent
-            for agent in sorted(agents, key=lambda item: item.agent_id)
-            if agent.available
-        }
-        candidate_tasks = {
-            task.task_id: task
-            for task in sorted(tasks, key=lambda item: item.task_id)
-            if task.status is TaskStatus.UNASSIGNED and task.assigned_agent is None
-        }
+        candidate_agents = _available_agents(agents)
+        candidate_tasks = _unassigned_tasks(tasks)
         allocations: list[Allocation] = []
 
-        while candidate_agents and candidate_tasks:
-            candidates = (
-                self.evaluate_candidate(agent, task)
-                for agent in candidate_agents.values()
-                for task in candidate_tasks.values()
+        fresh_positions_by_agent = {
+            agent_id: self._fresh_peer_positions(agent_id)
+            for agent_id in candidate_agents
+        }
+        ranked_pairs: list[tuple[int, int, float, int, int]] = []
+        for agent in candidate_agents.values():
+            fresh_peer_positions = fresh_positions_by_agent[agent.agent_id]
+            for task in candidate_tasks.values():
+                degree = self._predicted_degree_from_positions(
+                    task, fresh_peer_positions
+                )
+                ranked_pairs.append(
+                    (
+                        int(degree == 0),
+                        -degree,
+                        agent.distance_to(task.position),
+                        agent.agent_id,
+                        task.task_id,
+                    )
+                )
+
+        # Scores are immutable during one proposal batch. Sorting once is
+        # equivalent to repeatedly scanning every remaining UAV/task pair.
+        ranked_pairs.sort()
+        remaining_agent_ids = set(candidate_agents)
+        remaining_task_ids = set(candidate_tasks)
+        for isolation, negative_degree, distance, agent_id, task_id in ranked_pairs:
+            if agent_id not in remaining_agent_ids or task_id not in remaining_task_ids:
+                continue
+            allocations.append(
+                Allocation(
+                    agent_id=agent_id,
+                    task_id=task_id,
+                    distance=distance,
+                    policy="connectivity",
+                    predicted_peer_degree=-negative_degree,
+                    predicted_isolation=bool(isolation),
+                )
             )
-            selected = min(
-                candidates,
-                key=self._score,
-            )
-            allocations.append(selected)
-            del candidate_agents[selected.agent_id]
-            del candidate_tasks[selected.task_id]
+            remaining_agent_ids.remove(agent_id)
+            remaining_task_ids.remove(task_id)
+            if not remaining_agent_ids or not remaining_task_ids:
+                break
 
         return allocations
 

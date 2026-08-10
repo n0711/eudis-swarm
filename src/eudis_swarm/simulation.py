@@ -184,6 +184,7 @@ class Simulation:
         self._history: dict[int, list[tuple[float, Position]]] = {
             agent.agent_id: [(0.0, agent.position)] for agent in selected_agents
         }
+        self._last_position_record_time = 0.0
         self.communication_events: list[CommunicationEvent] = []
         self.peer_state_transport = PeerStateTransport(
             self.communication_graph, self.peer_state_stores
@@ -199,27 +200,20 @@ class Simulation:
         timestamp: float,
         positions: Mapping[int, Position] | None = None,
     ) -> None:
-        previous = max(
-            (entries[-1][0] for entries in self._history.values()),
-            default=None,
-        )
         timestamp = validate_timestamp(
             timestamp,
-            previous=previous,
+            previous=self._last_position_record_time,
             name="position-history timestamp",
         )
-        for agent in sorted(
-            self.mission.agents.values(), key=lambda item: item.agent_id
-        ):
+        for agent in self.mission.ordered_agents:
             position = (
                 agent.position if positions is None else positions[agent.agent_id]
             )
             self._history[agent.agent_id].append((timestamp, position))
+        self._last_position_record_time = timestamp
 
     def _advance_agents(self, elapsed: float) -> None:
-        for agent in sorted(
-            self.mission.agents.values(), key=lambda item: item.agent_id
-        ):
+        for agent in self.mission.ordered_agents:
             if (
                 agent.status is not AgentStatus.ACTIVE
                 or agent.current_task is None
@@ -235,9 +229,7 @@ class Simulation:
         if elapsed < 0.0:
             raise ValueError("elapsed must be non-negative")
         positions: dict[int, Position] = {}
-        for agent in sorted(
-            self.mission.agents.values(), key=lambda item: item.agent_id
-        ):
+        for agent in self.mission.ordered_agents:
             if (
                 agent.status is not AgentStatus.ACTIVE
                 or agent.current_task is None
@@ -260,9 +252,7 @@ class Simulation:
 
     def _complete_arrivals(self, timestamp: float) -> int:
         completed = 0
-        for agent in sorted(
-            self.mission.agents.values(), key=lambda item: item.agent_id
-        ):
+        for agent in self.mission.ordered_agents:
             if (
                 agent.status is not AgentStatus.ACTIVE
                 or agent.current_task is None
@@ -613,10 +603,10 @@ class Simulation:
                 not failure_injected and timestamp + epsilon >= self.config.failure_time
             )
             maximum_time_due = timestamp + epsilon >= self.config.max_simulation_time
-            legacy_boundary = (
+            mission_boundary = (
                 motion_due or heartbeat_due or failure_due or maximum_time_due
             )
-            if legacy_boundary:
+            if mission_boundary:
                 self._advance_agents(timestamp - last_physical_update_time)
                 last_physical_update_time = timestamp
                 communication_positions: Mapping[int, Position] | None = None
@@ -650,11 +640,12 @@ class Simulation:
 
             # Communication-only boundaries are observational. They must not
             # introduce extra task completion, allocation, or failure checks.
-            if not legacy_boundary:
+            if not mission_boundary:
                 self._record_positions(timestamp, communication_positions)
                 self.mission.assert_consistent()
                 continue
 
+            # Publication precedes centralized recovery and new allocation.
             if heartbeat_due:
                 snapshots = self.mission.exchange_heartbeats(timestamp)
                 self._deliver_peer_state(snapshots, timestamp)

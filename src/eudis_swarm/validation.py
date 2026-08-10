@@ -32,3 +32,29 @@ def validate_positive_integer(value: int, *, name: str) -> int:
     if not isinstance(value, int) or isinstance(value, bool) or value < 1:
         raise ValueError(f"{name} must be an integer greater than zero")
     return value
+
+
+def validate_positive_real(value: float, *, name: str) -> float:
+    """Return a finite positive real number, rejecting booleans explicitly."""
+
+    if (
+        not isinstance(value, Real)
+        or isinstance(value, bool)
+        or not isfinite(value)
+        or value <= 0.0
+    ):
+        raise ValueError(f"{name} must be finite and greater than zero")
+    return float(value)
+
+
+def validate_nonnegative_real(value: float, *, name: str) -> float:
+    """Return a finite non-negative real number, rejecting booleans."""
+
+    if (
+        not isinstance(value, Real)
+        or isinstance(value, bool)
+        or not isfinite(value)
+        or value < 0.0
+    ):
+        raise ValueError(f"{name} must be finite and non-negative")
+    return float(value)
